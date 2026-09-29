@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         [银河奶牛]生产制作计算器
-// @version      0.1.2
+// @version      0.1.3
 // @namespace    http://tampermonkey.net/
 // @description  银河奶牛计算器，自动计算需求缺口，一键跳转到制作、购买。Calculator for MilkyWayIdle，Automatically calculate supply-demand gaps and navigate to production or purchasing with a single click.
 // @author       RERoger
@@ -2337,12 +2337,14 @@
             const actionHrid = MWI_Calculator_ActionDetailPlus.getActionHrid(requiredItem.displayName)
                 ?? MWI_Calculator_ActionDetailPlus.processableActionMap.get(requiredItem.itemHrid);
             if (!actionHrid) {
-                return;
+                // 无制作渠道时沿用购买跳转，不切换全局制作/购买模式。
+                return this.TryGotoMarketplaceByRequiredItem(requiredItem);
             }
             const { upgradeItemHrid, inputItems, outputItems } = MWI_Calculator_ActionDetailPlus.calculateActionDetail(actionHrid);
             const outputCount = outputItems.find(oi => oi.itemHrid === requiredItem.itemHrid)?.count;
             if (!outputCount) {
-                return;
+                // 动作缺失、不支持或未产出该物品时同样进入购买界面。
+                return this.TryGotoMarketplaceByRequiredItem(requiredItem);
             }
             if (!actionHrid.includes('/milking/') && !actionHrid.includes('/foraging/') && !actionHrid.includes('/woodcutting/')) {
                 // 与备料展开共用产出参数、模式和保底上限。
