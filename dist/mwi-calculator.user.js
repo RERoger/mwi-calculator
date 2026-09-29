@@ -35,6 +35,8 @@
         onAction: '#FFFFFF'
     });
     const MWI_Calculator_UIStyles = Object.freeze({
+        // 房屋等级、大类数量与目标条目数量统一宽度，避免 flex 挤压造成不一致。
+        quantityInput: Object.freeze({ width: '60px', flex: '0 0 60px' }),
         // 公用物品行：上下无外边距、无圆角，背景连续；保留左右及行内留白。
         itemRow: Object.freeze({ border: 'none', borderRadius: '0', padding: '1px',
             margin: '0 2px', display: 'flex', alignItems: 'center' }),
@@ -54,6 +56,72 @@
             display: 'inline-flex', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' })
     });
     class MWI_Calculator_UI {
+        // 仅目标行使用此布局：名称先收缩，操作区不参与 flex 压缩。
+        static attachTargetLayout(row, nameGroup, controls, owned, input, removeButton) {
+            row.classList.add('mwi-target-row');
+            nameGroup.classList.add('mwi-target-name');
+            nameGroup.querySelector('span')?.classList.add('mwi-target-label');
+            controls.classList.add('mwi-target-controls');
+            owned.classList.add('mwi-target-owned');
+            input.classList.add('mwi-target-input');
+            removeButton.classList.add('mwi-target-remove');
+            this.targetLayouts ||= new WeakMap();
+            this.targetLayouts.set(row, { controls, input, checkbox: row.querySelector('input[type="checkbox"]') });
+            if (!this.targetLayoutObserver && typeof ResizeObserver !== 'undefined') {
+                this.targetLayoutObserver = new ResizeObserver(entries => {
+                    for (const entry of entries) this.scheduleTargetLayout(entry.target);
+                });
+            }
+            this.targetLayoutObserver?.observe(row);
+            this.scheduleTargetLayout(row);
+        }
+        static scheduleTargetLayout(row) {
+            if (!row || !this.targetLayouts?.has(row)) return;
+            this.pendingTargetLayouts ||= new Set();
+            this.pendingTargetLayouts.add(row);
+            if (this.targetLayoutFrame) return;
+            this.targetLayoutFrame = requestAnimationFrame(() => {
+                this.targetLayoutFrame = null;
+                const rows = [...this.pendingTargetLayouts];
+                this.pendingTargetLayouts.clear();
+                for (const element of rows) if (element.isConnected) this.fitTargetLayout(element);
+            });
+        }
+        static fitTargetLayout(row) {
+            const layout = this.targetLayouts?.get(row);
+            if (!layout || row.clientWidth === 0) return; // 折叠状态等待 ResizeObserver 重新触发。
+            const outerWidth = element => {
+                if (!element) return 0;
+                const style = getComputedStyle(element);
+                return element.getBoundingClientRect().width + (parseFloat(style.marginLeft) || 0) + (parseFloat(style.marginRight) || 0);
+            };
+            const style = getComputedStyle(row);
+            const available = row.clientWidth - (parseFloat(style.paddingLeft) || 0)
+                - (parseFloat(style.paddingRight) || 0) - outerWidth(layout.checkbox);
+            this.targetTextCanvas ||= document.createElement('canvas');
+            const context = this.targetTextCanvas.getContext('2d');
+            const fits = () => {
+                const inputStyle = getComputedStyle(layout.input);
+                if (context) context.font = inputStyle.font;
+                const textWidth = context ? context.measureText(layout.input.value || layout.input.placeholder).width : 0;
+                const inputSpace = layout.input.clientWidth - (parseFloat(inputStyle.paddingLeft) || 0) - (parseFloat(inputStyle.paddingRight) || 0);
+                return outerWidth(layout.controls) <= available + 0.5 && textWidth <= inputSpace + 0.5;
+            };
+            // 先允许名称缩至零，再缩字号；不会缩小60px输入框和26px删除按钮。
+            for (let size = 14; size >= 8; size--) {
+                row.style.setProperty('--mwi-target-font-size', size + 'px');
+                if (fits()) break;
+            }
+            // 极端窄屏保留横向访问，不以隐藏数量/按钮换取表面上的“适配”。
+            const overflow = outerWidth(layout.controls) > available + 0.5;
+            if (row.style.overflowX !== (overflow ? 'auto' : '')) row.style.overflowX = overflow ? 'auto' : '';
+        }
+        static detachTargetLayout(row) {
+            if (!row) return;
+            this.targetLayoutObserver?.unobserve(row);
+            this.targetLayouts?.delete(row);
+            this.pendingTargetLayouts?.delete(row);
+        }
         // 状态函数只读取数据，不修改勾选值、库存、目标数量或 DOM。
         static getTargetState(item, categoryEnabled = true) {
             if (!item.needCalc || !categoryEnabled || item.count <= 0) return 'inactive';
@@ -188,8 +256,10 @@
                     this.targetInput.value = newText;
                 }
             }
+            MWI_Calculator_UI.scheduleTargetLayout(this.displayElement);
         }
         removeDisplayElement() {
+            MWI_Calculator_UI.detachTargetLayout(this.displayElement);
             this.displayElement?.remove();
         }
     }
@@ -788,6 +858,49 @@
                     #mwi-calculator-panel .mwi-planning-selector { padding:2px !important; }
                     #mwi-calculator-panel .mwi-planning-selector button { padding:3px 1px !important; margin:1px !important; }
                 }
+                /* 仅大类数量框隐藏原生步进按钮，保留 number 校验与键盘步进。 */
+                #mwi-calculator-panel input.mwi-category-quantity {
+                    -moz-appearance:textfield; appearance:textfield;
+                }
+                #mwi-calculator-panel input.mwi-category-quantity::-webkit-inner-spin-button,
+                #mwi-calculator-panel input.mwi-category-quantity::-webkit-outer-spin-button {
+                    -webkit-appearance:none; margin:0;
+                }
+                /* 目标清单行：数量完整，操作区固定，只有名称占用剩余空间。 */
+                #mwi-calculator-panel .mwi-target-row {
+                    flex-wrap:nowrap; align-items:center !important; min-width:0; box-sizing:border-box;
+                }
+                #mwi-calculator-panel .mwi-target-row > input[type="checkbox"] {
+                    flex:0 0 auto; align-self:center; margin-top:0; margin-bottom:0;
+                }
+                #mwi-calculator-panel .mwi-target-row .mwi-target-name {
+                    flex:1 1 0; min-width:0 !important; overflow:hidden; align-self:center;
+                    justify-content:flex-start; align-items:center !important; text-align:left;
+                }
+                #mwi-calculator-panel .mwi-target-name > div { flex:0 0 auto; display:flex; align-items:center; }
+                #mwi-calculator-panel .mwi-target-name > div > svg { display:block; }
+                #mwi-calculator-panel .mwi-target-row .mwi-target-label {
+                    flex:1 1 0; min-width:0 !important; overflow:hidden; text-overflow:ellipsis;
+                    white-space:nowrap; font-size:var(--mwi-target-font-size,14px); line-height:18px;
+                    text-align:left; align-self:center;
+                }
+                #mwi-calculator-panel .mwi-target-row .mwi-target-controls {
+                    flex:0 0 auto; width:max-content; max-width:none !important; min-width:max-content !important;
+                    margin-left:auto; align-self:center; align-items:center; white-space:nowrap;
+                }
+                #mwi-calculator-panel .mwi-target-controls > span {
+                    flex:0 0 auto; max-width:none !important; overflow:visible !important; text-overflow:clip !important;
+                    white-space:nowrap; font-size:var(--mwi-target-font-size,14px); line-height:18px;
+                    font-variant-numeric:tabular-nums;
+                }
+                #mwi-calculator-panel .mwi-target-controls .mwi-target-input {
+                    box-sizing:border-box; width:60px !important; min-width:60px !important; max-width:60px !important;
+                    flex:0 0 60px !important; font-size:var(--mwi-target-font-size,14px); line-height:18px;
+                }
+                #mwi-calculator-panel .mwi-target-controls .mwi-target-remove {
+                    box-sizing:border-box; width:26px !important; min-width:26px !important; max-width:26px !important;
+                    height:26px; flex:0 0 26px; display:flex; align-items:center; justify-content:center;
+                }
             `;
             document.head.appendChild(style);
         }
@@ -1113,8 +1226,8 @@
             Object.assign(dropdown.firstElementChild.style, {
                 minWidth: '0', whiteSpace: 'nowrap', overflow: 'hidden'
             });
-            Object.assign(input.style, {
-                height: 'auto', width: '35px', flex: '0 0 35px',
+            Object.assign(input.style, MWI_Calculator_UIStyles.quantityInput, {
+                height: 'auto',
                 padding: '4px', margin: '2px'
             });
             Object.assign(button.style, {
@@ -1151,7 +1264,7 @@
             selected.style.display = 'flex';
             selected.style.alignItems = 'center';
             selected.style.whiteSpace = 'nowrap';
-            selected.textContent = MWI_Calculator_I18n.isChinese() ? '选择物品大类' : 'Select item category';
+            selected.textContent = MWI_Calculator_I18n.isChinese() ? '选择大类' : 'Select item category';
             const list = document.createElement('div');
             list.style.background = MWI_Calculator_UITheme.surface;
             list.style.borderRadius = '4px';
@@ -1212,13 +1325,14 @@
             countInput.step = '1';
             countInput.value = '0';
             countInput.title = MWI_Calculator_I18n.isChinese() ? '每个物品添加数量' : 'Quantity per item';
+            countInput.classList.add('mwi-category-quantity');
             countInput.style.background = '#dde2f8';
             countInput.style.color = '#000000';
             countInput.style.border = 'none';
             countInput.style.borderRadius = '4px';
             countInput.style.padding = '4px';
             countInput.style.margin = '2px';
-            countInput.style.width = '35px';
+            Object.assign(countInput.style, MWI_Calculator_UIStyles.quantityInput);
             const addButton = document.createElement('button');
             addButton.type = 'button';
             addButton.textContent = MWI_Calculator_I18n.isChinese() ? '添加' : 'Add';
@@ -1643,7 +1757,7 @@
             levelInput.style.borderRadius = '4px';
             levelInput.style.padding = '4px';
             levelInput.style.margin = '2px';
-            levelInput.style.width = '35px';
+            Object.assign(levelInput.style, MWI_Calculator_UIStyles.quantityInput);
             // 添加按钮
             const addListButton = document.createElement('button');
             addListButton.textContent = (MWI_Calculator_I18n.isChinese()) ? '添加' : 'Add';
@@ -1901,7 +2015,7 @@
         }
         // 创建目标物品元素
         static createTargetItemDisplayElement(targetItem) {
-            const { container, itemContainer, rightDiv } = MWI_Calculator_Calculator.createBaseItemDisplayItem(targetItem);
+            const { container, itemContainer, leftDiv, rightDiv } = MWI_Calculator_Calculator.createBaseItemDisplayItem(targetItem);
             const needCalcCheckbox = document.createElement('input');
             needCalcCheckbox.type = 'checkbox';
             container.prepend(needCalcCheckbox);
@@ -1927,7 +2041,7 @@
             targetInput.style.borderRadius = '4px';
             targetInput.style.padding = '4px';
             targetInput.style.margin = '2px';
-            targetInput.style.width = '60px';
+            Object.assign(targetInput.style, MWI_Calculator_UIStyles.quantityInput);
             // 绑定输入事件
             targetInput.addEventListener('input', function () {
                 // 清理非数字字符
@@ -1958,6 +2072,9 @@
             targetItem.needCalcCheckbox = needCalcCheckbox;
             targetItem.ownedSpan = ownedSpan;
             targetItem.targetInput = targetInput;
+            leftDiv.remove();
+            MWI_Calculator_UI.attachTargetLayout(container, itemContainer, rightDiv, ownedSpan, targetInput, removeButton);
+            targetInput.addEventListener('input', () => MWI_Calculator_UI.scheduleTargetLayout(container));
         }
         // 创建缺口物品元素
         static createShortageItemDisplayElement(requiredItem) {
