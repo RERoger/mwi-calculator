@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         [银河奶牛]生产制作计算器
-// @version      0.1.1
+// @version      0.1.2
 // @namespace    http://tampermonkey.net/
 // @description  银河奶牛计算器，自动计算需求缺口，一键跳转到制作、购买。Calculator for MilkyWayIdle，Automatically calculate supply-demand gaps and navigate to production or purchasing with a single click.
 // @author       RERoger
@@ -663,44 +663,102 @@
                 return false;
             }
         }
-        // 合并导入：只新增当前清单缺少的物品（数量/勾选用源角色的值），已有物品保持不变
-        static mergeItemsFromCharacter(sourceID) {
+        // 导入事务：保存失败时恢复三组存储及原内存清单，不报告成功。
+        static runImportTransaction(apply) {
+            if (!this.canUseCharacterData()) return null;
+            const destinationKey = this.getStorageKey(this.activeCharacterID);
+            const records = [];
+            const items = new Map(this.targetItemsMap);
+            const categories = new Map(this.targetItemCategoryMap);
+            const categoryStates = [...categories.values()].map(category => [category, category.needCalc]);
+            const details = [this.targetItemDetailsMap, this.shortageItemDetailsMap, this.requiredItemDetailsMap]
+                .flatMap(map => [...map.values()].map(element => [element, element.open, element.hidden]));
             try {
-                const loadedItems = JSON.parse(GM_getValue(this.getStorageKey(sourceID), '[]'));
-                if (!Array.isArray(loadedItems)) throw new Error('清单格式无效');
-                let added = 0, kept = 0;
-                for (const item of loadedItems) {
-                    if (!item || typeof item.itemHrid !== 'string' || !Number.isFinite(item.count)) continue;
-                    if (this.targetItemsMap.has(item.itemHrid)) { kept++; continue; }
-                    const enabled = typeof item.needCalc === 'boolean' ? item.needCalc : true;
-                    if (item.itemHrid.startsWith('/items/')) this.targetItemsMap.set(item.itemHrid, new TargetItem(item.itemHrid, item.count, enabled));
-                    else if (item.itemHrid.startsWith('/house_rooms/')) this.targetItemsMap.set(item.itemHrid, new TargetHouseRoom(item.itemHrid, item.count, enabled));
-                    else continue;
-                    added++;
+                for (const field of ['TargetItems', 'TargetItemCategories', 'DetailsOpenState']) {
+                    const key = destinationKey.replace('TargetItems', field);
+                    records.push([key, GM_getValue(key, field === 'DetailsOpenState' ? '{}' : '[]')]);
                 }
-                this.saveCalculatorData();
+                const result = apply();
+                if (!result) throw new Error('导入加载失败');
                 this.renderItemsDisplay();
-                console.log(`[MWI_Calculator] 合并导入完成：新增 ${added} 项，已存在保留 ${kept} 项`);
-                return { added, kept };
+                if (!this.saveCalculatorData()) throw new Error('导入保存失败');
+                // 同时验证三组数据，捕获底层写入失败或静默丢写。
+                const expectedDetails = {};
+                for (const [prefix, map] of [['target', this.targetItemDetailsMap], ['shortage', this.shortageItemDetailsMap], ['required', this.requiredItemDetailsMap]]) {
+                    map.forEach((element, key) => { expectedDetails[`${prefix}_${key}`] = element.open; });
+                }
+                const expected = [
+                    [...this.targetItemsMap.values()].map(({ itemHrid, count, needCalc }) => ({ itemHrid, count, needCalc })),
+                    [...this.targetItemCategoryMap.values()].map(({ categoryHrid, needCalc }) => ({ categoryHrid, needCalc })),
+                    expectedDetails
+                ];
+                records.forEach(([key], index) => {
+                    if (GM_getValue(key) !== JSON.stringify(expected[index])) throw new Error('导入写入校验失败');
+                });
+                return result;
             }
             catch (error) {
-                console.error('[MWI_Calculator] 合并导入失败，保留原存储', error);
+                let restored = true;
+                for (const [key, value] of records) {
+                    try {
+                        if (GM_getValue(key) !== value) GM_setValue(key, value);
+                        if (GM_getValue(key) !== value) throw new Error('恢复校验失败');
+                    }
+                    catch (restoreError) { restored = false; console.error('[MWI_Calculator] 导入恢复失败', restoreError); }
+                }
+                this.targetItemsMap = items;
+                this.targetItemCategoryMap = categories;
+                categoryStates.forEach(([category, enabled]) => { category.needCalc = enabled; });
+                details.forEach(([element, open, hidden]) => { element.open = open; element.hidden = hidden; });
+                this.characterDataLoaded = restored;
+                try { this.renderItemsDisplay(); }
+                catch (renderError) { this.characterDataLoaded = false; console.error('[MWI_Calculator] 恢复显示失败', renderError); }
+                console.error('[MWI_Calculator] 导入未完成', error);
                 return null;
             }
         }
-        static async chooseImportMode(sourceID) {
-            const mode = await this.showImportModeDialog(sourceID);
-            if (!mode) return;
-            if (!this.backupCurrentListBeforeImport()) return;
-            if (mode === 'overwrite') {
-                if (this.loadCalculatorData(sourceID, { importToCurrent: true })) {
-                    alert(`已用角色 ${sourceID} 的清单覆盖当前清单`);
+        // 合并导入：先在副本中构建，只新增缺少的物品，保留已有数量和勾选状态。
+        static mergeItemsFromCharacter(sourceID) {
+            return this.runImportTransaction(() => {
+                const loadedItems = JSON.parse(GM_getValue(this.getStorageKey(sourceID), '[]'));
+                if (!Array.isArray(loadedItems)) throw new Error('清单格式无效');
+                const merged = new Map(this.targetItemsMap);
+                let added = 0, kept = 0;
+                for (const item of loadedItems) {
+                    if (!item || typeof item.itemHrid !== 'string' || !Number.isFinite(item.count)) throw new Error('目标格式无效');
+                    if (merged.has(item.itemHrid)) { kept++; continue; }
+                    const enabled = typeof item.needCalc === 'boolean' ? item.needCalc : true;
+                    if (item.itemHrid.startsWith('/items/')) merged.set(item.itemHrid, new TargetItem(item.itemHrid, item.count, enabled));
+                    else if (item.itemHrid.startsWith('/house_rooms/')) merged.set(item.itemHrid, new TargetHouseRoom(item.itemHrid, item.count, enabled));
+                    else throw new Error('未知目标类型');
+                    added++;
                 }
+                this.targetItemsMap = merged;
+                return { added, kept };
+            });
+        }
+        static async chooseImportMode(sourceID) {
+            if (!this.canUseCharacterData() || this.importDialogPending) return false;
+            const destinationID = this.activeCharacterID;
+            const generation = this.characterGeneration;
+            this.importDialogPending = true;
+            try {
+                const mode = await this.showImportModeDialog(sourceID);
+                if (mode !== 'merge' && mode !== 'overwrite') return false;
+                // 包括 A -> B -> A：旧弹窗同样失效，绝不导入到新会话。
+                if (!this.canUseCharacterData() || this.activeCharacterID !== destinationID
+                    || this.characterGeneration !== generation) return false;
+                if (!this.backupCurrentListBeforeImport()) return false;
+                const result = mode === 'overwrite'
+                    ? this.runImportTransaction(() => this.loadCalculatorData(sourceID, { importToCurrent: true }))
+                    : this.mergeItemsFromCharacter(sourceID);
+                if (!result) { alert('导入失败，未完成保存；请检查控制台，确认原清单后重试。'); return false; }
+                alert(mode === 'overwrite' ? `已用角色 ${sourceID} 的清单覆盖当前清单`
+                    : `合并导入完成：新增 ${result.added} 项，已存在 ${result.kept} 项保持不变`);
+                return true;
             }
-            else {
-                const res = this.mergeItemsFromCharacter(sourceID);
-                if (res) alert(`合并导入完成：新增 ${res.added} 项，已存在 ${res.kept} 项保持不变`);
-            }
+            catch (error) { console.error('[MWI_Calculator] 导入失败', error); return false; }
+            finally { this.importDialogPending = false; }
         }
         // 更新目标物品
         static updateTargetItem(itemHrid, count = 1) {
