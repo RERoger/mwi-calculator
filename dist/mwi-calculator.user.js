@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         [银河奶牛]生产制作计算器
-// @version      0.1.0
+// @version      0.1.1
 // @namespace    http://tampermonkey.net/
 // @description  银河奶牛计算器，自动计算需求缺口，一键跳转到制作、购买。Calculator for MilkyWayIdle，Automatically calculate supply-demand gaps and navigate to production or purchasing with a single click.
 // @author       RERoger
@@ -607,7 +607,47 @@
             const sourceID = this.normalizeCharacterID(characterID);
             if (sourceID == null) return false;
             if (sourceID === this.activeCharacterID) return this.loadCalculatorData();
-            if (!confirm(`将角色 ${sourceID} 的清单复制到当前角色 ${this.activeCharacterID}？这会替换当前清单。`)) return false;
+            // 三选一弹窗：合并导入 / 覆盖替换 / 取消（原为 confirm 二选一）
+            void this.chooseImportMode(sourceID);
+            return true;
+        }
+        // 导入方式选择弹窗，resolve('merge' | 'overwrite' | null)
+        static showImportModeDialog(sourceID) {
+            return new Promise(resolve => {
+                const finish = value => { overlay.remove(); resolve(value); };
+                const overlay = document.createElement('div');
+                overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center';
+                const box = document.createElement('div');
+                box.style.cssText = 'position:relative;width:min(380px,90vw);padding:16px;border-radius:12px;'
+                    + 'background:linear-gradient(145deg,#152447,#1d3566);color:#eef3ff;border:1px solid #6f9bd8;'
+                    + 'box-shadow:0 10px 28px rgba(3,10,26,.55);font:13px/1.6 system-ui,sans-serif';
+                const text = document.createElement('div');
+                text.style.cssText = 'margin-bottom:12px';
+                text.textContent = `将角色 ${sourceID} 的清单导入到当前角色 ${this.activeCharacterID}：`;
+                const btnRow = document.createElement('div');
+                btnRow.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap';
+                const mkBtn = (label, bg, title, value) => {
+                    const btn = document.createElement('button');
+                    btn.type = 'button';
+                    btn.textContent = label;
+                    btn.title = title;
+                    btn.style.cssText = `border:0;border-radius:7px;padding:6px 10px;background:${bg};color:#fff;cursor:pointer;font:600 12px/1.4 system-ui,sans-serif`;
+                    btn.addEventListener('click', () => finish(value));
+                    return btn;
+                };
+                btnRow.append(
+                    mkBtn('合并导入', '#2e7d32', '只新增当前清单缺少的物品，已有的物品保持不变', 'merge'),
+                    mkBtn('覆盖替换', '#c05621', '用源角色清单整体替换当前清单（原有物品会被清除）', 'overwrite'),
+                    mkBtn('取消', '#344879', '不做任何改动', null),
+                );
+                box.append(text, btnRow);
+                overlay.appendChild(box);
+                overlay.addEventListener('click', ev => { if (ev.target === overlay) finish(null); });
+                document.body.appendChild(overlay);
+            });
+        }
+        // 导入前备份当前清单三件套（TargetItems/TargetItemCategories/DetailsOpenState），失败返回 false
+        static backupCurrentListBeforeImport() {
             const destinationKey = this.getStorageKey(this.activeCharacterID);
             try {
                 const backup = {};
@@ -616,12 +656,51 @@
                     backup[key] = GM_getValue(key, field === 'DetailsOpenState' ? '{}' : '[]');
                 }
                 GM_setValue(destinationKey + '_BackupBeforeImport', JSON.stringify(backup));
+                return true;
             }
             catch (error) {
                 console.error('[MWI_Calculator] 导入备份失败，已取消导入', error);
                 return false;
             }
-            return this.loadCalculatorData(sourceID, { importToCurrent: true }) && this.saveCalculatorData();
+        }
+        // 合并导入：只新增当前清单缺少的物品（数量/勾选用源角色的值），已有物品保持不变
+        static mergeItemsFromCharacter(sourceID) {
+            try {
+                const loadedItems = JSON.parse(GM_getValue(this.getStorageKey(sourceID), '[]'));
+                if (!Array.isArray(loadedItems)) throw new Error('清单格式无效');
+                let added = 0, kept = 0;
+                for (const item of loadedItems) {
+                    if (!item || typeof item.itemHrid !== 'string' || !Number.isFinite(item.count)) continue;
+                    if (this.targetItemsMap.has(item.itemHrid)) { kept++; continue; }
+                    const enabled = typeof item.needCalc === 'boolean' ? item.needCalc : true;
+                    if (item.itemHrid.startsWith('/items/')) this.targetItemsMap.set(item.itemHrid, new TargetItem(item.itemHrid, item.count, enabled));
+                    else if (item.itemHrid.startsWith('/house_rooms/')) this.targetItemsMap.set(item.itemHrid, new TargetHouseRoom(item.itemHrid, item.count, enabled));
+                    else continue;
+                    added++;
+                }
+                this.saveCalculatorData();
+                this.renderItemsDisplay();
+                console.log(`[MWI_Calculator] 合并导入完成：新增 ${added} 项，已存在保留 ${kept} 项`);
+                return { added, kept };
+            }
+            catch (error) {
+                console.error('[MWI_Calculator] 合并导入失败，保留原存储', error);
+                return null;
+            }
+        }
+        static async chooseImportMode(sourceID) {
+            const mode = await this.showImportModeDialog(sourceID);
+            if (!mode) return;
+            if (!this.backupCurrentListBeforeImport()) return;
+            if (mode === 'overwrite') {
+                if (this.loadCalculatorData(sourceID, { importToCurrent: true })) {
+                    alert(`已用角色 ${sourceID} 的清单覆盖当前清单`);
+                }
+            }
+            else {
+                const res = this.mergeItemsFromCharacter(sourceID);
+                if (res) alert(`合并导入完成：新增 ${res.added} 项，已存在 ${res.kept} 项保持不变`);
+            }
         }
         // 更新目标物品
         static updateTargetItem(itemHrid, count = 1) {
@@ -1504,8 +1583,9 @@
             });
             // 搜索功能
             itemSearchInput.addEventListener('input', () => {
-                const searchTerm = itemSearchInput.value.toLowerCase().trim();
-                if (searchTerm.length < 1) {
+                // 支持多关键词（空格隔开）：物品名称需同时包含全部关键词（AND 语义）
+                const searchTerms = itemSearchInput.value.toLowerCase().trim().split(/\s+/).filter(Boolean);
+                if (searchTerms.length < 1) {
                     searchResults.style.display = 'none';
                     return;
                 }
@@ -1515,7 +1595,8 @@
                     return;
                 const filteredItems = Object.keys(itemDetailMap)
                     .filter(itemHrid => {
-                    return MWI_Calculator_I18n.getItemName(itemHrid).toLowerCase().includes(searchTerm);
+                    const name = MWI_Calculator_I18n.getItemName(itemHrid).toLowerCase();
+                    return searchTerms.every(term => name.includes(term));
                 })
                     .sort((a, b) => {
                     const sortIndexA = MWI_Calculator_Utils.getSortIndexByItemHrid(a);
