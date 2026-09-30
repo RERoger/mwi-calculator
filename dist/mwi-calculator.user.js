@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         [银河奶牛]生产制作计算器
-// @version      0.1.3
+// @version      0.1.4
 // @namespace    http://tampermonkey.net/
 // @description  银河奶牛计算器，自动计算需求缺口，一键跳转到制作、购买。Calculator for MilkyWayIdle，Automatically calculate supply-demand gaps and navigate to production or purchasing with a single click.
 // @author       RERoger
@@ -76,7 +76,7 @@
             this.scheduleTargetLayout(row);
         }
         static scheduleTargetLayout(row) {
-            if (!row || !this.targetLayouts?.has(row)) return;
+            if (!row || !this.targetLayouts?.has(row) || !MWI_Calculator_Calculator.isPanelVisible()) return;
             this.pendingTargetLayouts ||= new Set();
             this.pendingTargetLayouts.add(row);
             if (this.targetLayoutFrame) return;
@@ -89,13 +89,16 @@
         }
         static fitTargetLayout(row) {
             const layout = this.targetLayouts?.get(row);
-            if (!layout || row.clientWidth === 0) return; // 折叠状态等待 ResizeObserver 重新触发。
+            if (!layout || !MWI_Calculator_Calculator.isPanelVisible() || row.clientWidth === 0) return; // 折叠状态等待 ResizeObserver 重新触发。
             const outerWidth = element => {
                 if (!element) return 0;
                 const style = getComputedStyle(element);
                 return element.getBoundingClientRect().width + (parseFloat(style.marginLeft) || 0) + (parseFloat(style.marginRight) || 0);
             };
             const style = getComputedStyle(row);
+            const signature = JSON.stringify([row.clientWidth, layout.controls.textContent, layout.input.value,
+                style.fontFamily, style.fontWeight, style.letterSpacing, window.devicePixelRatio, this.fontGeneration || 0]);
+            if (layout.signature === signature) return;
             const available = row.clientWidth - (parseFloat(style.paddingLeft) || 0)
                 - (parseFloat(style.paddingRight) || 0) - outerWidth(layout.checkbox);
             this.targetTextCanvas ||= document.createElement('canvas');
@@ -115,6 +118,7 @@
             // 极端窄屏保留横向访问，不以隐藏数量/按钮换取表面上的“适配”。
             const overflow = outerWidth(layout.controls) > available + 0.5;
             if (row.style.overflowX !== (overflow ? 'auto' : '')) row.style.overflowX = overflow ? 'auto' : '';
+            layout.signature = signature;
         }
         static detachTargetLayout(row) {
             if (!row) return;
@@ -139,11 +143,17 @@
             return hasActiveTarget ? 'completed' : 'pending';
         }
         static renderTargetState(element, state) {
+            this.paintedStates ||= new WeakMap();
+            if (this.paintedStates.get(element) === state) return;
+            this.paintedStates.set(element, state);
             const colors = MWI_Calculator_UITheme;
             element.style.background = state === 'inactive' ? colors.disabledSurface
                 : state === 'pending' ? colors.pending : colors.surface;
         }
         static renderCategoryState(details, summary, state) {
+            this.paintedStates ||= new WeakMap();
+            if (this.paintedStates.get(summary) === state) return;
+            this.paintedStates.set(summary, state);
             const colors = MWI_Calculator_UITheme;
             details.style.background = state === 'inactive' ? colors.disabledSurface : colors.surface;
             summary.style.background = state === 'inactive' ? colors.disabledHeading
@@ -194,8 +204,9 @@
             this.categoryHrid = categoryHrid;
             this.needCalc = needCalc;
         }
-        updateDisplayElement() {
-            const state = MWI_Calculator_UI.getCategoryState(this, MWI_Calculator_Calculator.targetItemsMap.values());
+        updateDisplayElement(items = MWI_Calculator_Calculator.targetItemsMap.values()) {
+            if (!MWI_Calculator_Calculator.isPanelVisible()) return;
+            const state = MWI_Calculator_UI.getCategoryState(this, items);
             MWI_Calculator_UI.renderCategoryState(this.categoryDetailsElement, this.categorySummaryElement, state);
             this.needCalcCheckbox.checked = this.needCalc;
         }
@@ -238,8 +249,9 @@
             this.needCalc = needCalc;
         }
         updateDisplayElement() {
+            if (!MWI_Calculator_Calculator.isPanelVisible()) return;
             if (this.needCalcCheckbox) {
-                this.needCalcCheckbox.checked = this.needCalc;
+                if (this.needCalcCheckbox.checked !== this.needCalc) this.needCalcCheckbox.checked = this.needCalc;
                 const categoryEnabled = MWI_Calculator_Calculator.targetItemCategoryMap.get(this.categoryHrid)?.needCalc !== false;
                 const state = MWI_Calculator_UI.getTargetState(this, categoryEnabled);
                 MWI_Calculator_UI.renderTargetState(this.displayElement, state);
@@ -292,6 +304,7 @@
             this.overflowCount = overflowCount;
         }
         updateDisplayElement() {
+            if (!MWI_Calculator_Calculator.isPanelVisible()) return;
             const netCount = this.shortageCount > 0 ? -this.shortageCount : this.overflowCount;
             if (this.shortageSpan) {
                 const newText = MWI_Calculator_Utils.formatNumber(this.shortageCount);
@@ -324,7 +337,8 @@
                 }
             }
             if (this.displayNameSpan) {
-                this.displayNameSpan.textContent = Math.floor(netCount / this.count * 100) + '%';
+                const percentage = Math.floor(netCount / this.count * 100) + '%';
+                if (this.displayNameSpan.textContent !== percentage) this.displayNameSpan.textContent = percentage;
                 if (netCount < 0) {
                     this.displayNameSpan.style.color = MWI_Calculator_UITheme.danger;
                 }
@@ -830,6 +844,40 @@
             MWI_Calculator_Calculator.targetItemsMap.clear();
             MWI_Calculator_Calculator.saveAndScheduleRender();
         }
+        static isPanelVisible() {
+            if (this.renderingVisible) return true; // 同步刷新批次仅检查一次布局可见性。
+            return !!(this.calculatorActive && this.tabPanel?.isConnected && !this.tabPanel.hidden
+                && !document.hidden && this.tabPanel.getClientRects().length
+                && getComputedStyle(this.tabPanel).visibility !== 'hidden');
+        }
+        static suspendPanelWork() {
+            this.renderDirty = true;
+            clearTimeout(this.renderTimeout);
+            this.renderTimeout = null;
+            clearInterval(this.marketAutoFillTimer);
+            this.marketAutoFillTimer = null;
+            this.marketAutoFillObserver?.disconnect();
+            this.marketAutoFillObserver = null;
+            this.marketAutoFillTarget = null;
+            if (this.marketFillFrame) cancelAnimationFrame(this.marketFillFrame);
+            this.marketFillFrame = null;
+            if (MWI_Calculator_UI.targetLayoutFrame) cancelAnimationFrame(MWI_Calculator_UI.targetLayoutFrame);
+            MWI_Calculator_UI.targetLayoutFrame = null;
+            MWI_Calculator_UI.pendingTargetLayouts?.clear();
+        }
+        static refreshPanelVisibility() {
+            if (!this.isPanelVisible()) { this.suspendPanelWork(); return; }
+            if (this.renderDirty && this.canUseCharacterData()) this.renderItemsDisplay();
+            if (this.marketAutoFillEnabled && !this.marketAutoFillObserver) this.ensureMarketAutoFillObserver();
+        }
+        static groupItems(items) {
+            const groups = new Map();
+            for (const item of [...items].sort((a, b) => a.sortIndex - b.sortIndex)) {
+                if (!groups.has(item.categoryHrid)) groups.set(item.categoryHrid, []);
+                groups.get(item.categoryHrid).push(item);
+            }
+            return groups;
+        }
         // 保存数据并计划渲染
         static saveAndScheduleRender() {
             // 保存数据到存储
@@ -840,7 +888,8 @@
         static scheduleRender() {
             clearTimeout(this.renderTimeout);
             this.renderTimeout = null;
-            if (!this.canUseCharacterData()) return;
+            this.renderDirty = true;
+            if (!this.canUseCharacterData() || !this.isPanelVisible()) return;
             const id = this.activeCharacterID;
             const generation = this.characterGeneration;
             this.renderTimeout = setTimeout(() => {
@@ -915,6 +964,7 @@
                 this.mountFrame = requestAnimationFrame(() => {
                     this.mountFrame = null;
                     this.createCalculatorUI();
+                    this.refreshPanelVisibility();
                 });
             };
             this.mountObserver = new MutationObserver(records => {
@@ -941,13 +991,28 @@
                     if (record.target === this.tabPanel || record.target === this.calculatorContent) return true;
                     if (record.type === 'childList' && this.calculatorContent
                         && [...record.removedNodes].some(node => node === this.calculatorContent || node.contains?.(this.calculatorContent))) return true;
-                    return !record.target.closest?.('#mwi-calculator-panel, #mwi-calculator-tab');
+                    if (record.target.closest?.('#mwi-calculator-panel, #mwi-calculator-tab')) return false;
+                    const navigation = this.calculatorMount?.navigation;
+                    if (!navigation?.isConnected || !this.tabPanel?.isConnected) return true;
+                    if (record.target === this.calculatorMount?.shell || record.target === navigation) return true;
+                    if (record.type === 'attributes') {
+                        return record.target.contains?.(navigation) || navigation.contains(record.target)
+                            || record.target.contains?.(this.tabPanel);
+                    }
+                    const selector = '[class*="CharacterManagement_"], [class*="TabsComponent_"], [role="tablist"], [role="tab"]';
+                    return [...record.addedNodes, ...record.removedNodes].some(node => node.nodeType === 1
+                        && (node.contains(navigation) || node.contains(this.tabPanel) || node.matches(selector) || node.querySelector(selector)));
                 });
                 if (relevant) schedule();
             });
             this.mountObserver.observe(document.body, {
                 childList: true, subtree: true, attributes: true,
                 attributeFilter: ['class', 'hidden', 'aria-selected', 'style']
+            });
+            document.addEventListener('visibilitychange', () => this.refreshPanelVisibility());
+            document.fonts?.addEventListener('loadingdone', () => {
+                MWI_Calculator_UI.fontGeneration = (MWI_Calculator_UI.fontGeneration || 0) + 1;
+                this.scheduleRender();
             });
             window.addEventListener('resize', schedule);
             if (typeof ResizeObserver !== 'undefined') {
@@ -1212,6 +1277,7 @@
         }
         static setCalculatorActive(active) {
             this.calculatorActive = active;
+            if (!active) this.suspendPanelWork();
             if (!active) {
                 this.closeCalculatorDropdowns();
                 this.restoreCalculatorSizing();
@@ -1238,6 +1304,7 @@
                 });
                 this.hiddenCalculatorSiblings?.clear();
             }
+            this.refreshPanelVisibility();
         }
         // 创建计算器面板
         static createCalculatorPanel() {
@@ -2076,20 +2143,27 @@
         }
         // 渲染物品列表
         static renderItemsDisplay() {
+            if (!this.isPanelVisible()) { this.renderDirty = true; return; }
+            const previous = MWI_Calculator_ActionDetailPlus.renderRecipeCache;
+            MWI_Calculator_ActionDetailPlus.renderRecipeCache = new Map();
+            this.renderingVisible = true;
+            try { this.renderVisibleItems(); this.renderDirty = false; }
+            finally {
+                this.renderingVisible = false;
+                MWI_Calculator_ActionDetailPlus.renderRecipeCache = previous;
+            }
+        }
+        static renderVisibleItems() {
+            const targetGroups = this.groupItems(this.targetItemsMap.values());
             MWI_Calculator_Calculator.targetItemCategoryMap.forEach((category) => {
-                category.updateDisplayElement();
+                category.updateDisplayElement(targetGroups.get(category.categoryHrid) || []);
             });
             // 这里只需要新增或更新，删除在targetItems变动时进行处理
             MWI_Calculator_Calculator.itemCategoryList.forEach(categoryHrid => {
                 const details = MWI_Calculator_Calculator.targetItemDetailsMap.get(categoryHrid);
                 let lastElement = details.querySelector('summary');
                 let itemCount = 0;
-                [...MWI_Calculator_Calculator.targetItemsMap.values()]
-                    .sort((a, b) => a.sortIndex - b.sortIndex)
-                    .forEach(targetItem => {
-                    if (targetItem.categoryHrid !== categoryHrid) {
-                        return;
-                    }
+                (targetGroups.get(categoryHrid) || []).forEach(targetItem => {
                     if (!targetItem.displayElement) {
                         MWI_Calculator_Calculator.createTargetItemDisplayElement(targetItem);
                         lastElement.insertAdjacentElement('afterend', targetItem.displayElement);
@@ -2098,7 +2172,7 @@
                     lastElement = targetItem.displayElement;
                     itemCount++;
                 });
-                details.hidden = itemCount === 0;
+                if (details.hidden !== (itemCount === 0)) details.hidden = itemCount === 0;
             });
             const inventoryMap = MWI_Calculator_ItemsMap.getInventoryMap();
             const totalNeeds = MWI_Calculator_Calculator.calculateAllRequiredItems(new Map());
@@ -2121,6 +2195,7 @@
                     MWI_Calculator_Calculator.requiredItemsMap.set(itemHrid, new RequiredItem(itemHrid, totalNeeds.get(itemHrid) || 0, remainNeeds.get(itemHrid) || 0, inventoryMap.get(itemHrid) || 0));
                 }
             });
+            const requiredGroups = this.groupItems(this.requiredItemsMap.values());
             MWI_Calculator_Calculator.itemCategoryList.forEach(categoryHrid => {
                 const shortageDetails = MWI_Calculator_Calculator.shortageItemDetailsMap.get(categoryHrid);
                 const requiredDetails = MWI_Calculator_Calculator.requiredItemDetailsMap.get(categoryHrid);
@@ -2128,12 +2203,7 @@
                 let lastRequiredElement = requiredDetails.querySelector('summary');
                 let shortageItemCount = 0;
                 let requiredItemCount = 0;
-                [...MWI_Calculator_Calculator.requiredItemsMap.values()]
-                    .sort((a, b) => a.sortIndex - b.sortIndex)
-                    .forEach(requiredItem => {
-                    if (requiredItem.categoryHrid !== categoryHrid) {
-                        return;
-                    }
+                (requiredGroups.get(categoryHrid) || []).forEach(requiredItem => {
                     if (!requiredItem.shortageDisplayElement) {
                         MWI_Calculator_Calculator.createShortageItemDisplayElement(requiredItem);
                         lastShortageElement.insertAdjacentElement('afterend', requiredItem.shortageDisplayElement);
@@ -2148,8 +2218,8 @@
                     shortageItemCount += requiredItem.shortageCount > 0 ? 1 : 0;
                     requiredItemCount++;
                 });
-                shortageDetails.hidden = shortageItemCount === 0;
-                requiredDetails.hidden = requiredItemCount === 0;
+                if (shortageDetails.hidden !== (shortageItemCount === 0)) shortageDetails.hidden = shortageItemCount === 0;
+                if (requiredDetails.hidden !== (requiredItemCount === 0)) requiredDetails.hidden = requiredItemCount === 0;
             });
         }
         // 创建目标物品元素
@@ -2452,12 +2522,19 @@
         // 监听市场购买弹窗并自动填入当前缺口数量。市场按钮点击后，弹窗
         // 是异步渲染的，因此不能只给按钮绑定 click 事件。
         static ensureMarketAutoFillObserver() {
+            this.marketAutoFillEnabled = true;
+            if (!this.isPanelVisible()) { this.suspendPanelWork(); return; }
             if (MWI_Calculator_Calculator.marketAutoFillObserver || typeof MutationObserver === 'undefined') {
                 MWI_Calculator_Calculator.prefillMarketplacePurchaseModal();
             }
             else {
                 MWI_Calculator_Calculator.marketAutoFillObserver = new MutationObserver(() => {
-                    MWI_Calculator_Calculator.prefillMarketplacePurchaseModal();
+                    if (!this.isPanelVisible()) { this.suspendPanelWork(); return; }
+                    if (this.marketFillFrame) return;
+                    this.marketFillFrame = requestAnimationFrame(() => {
+                        this.marketFillFrame = null;
+                        this.prefillMarketplacePurchaseModal();
+                    });
                 });
                 const root = document.body || document.documentElement;
                 if (root) {
@@ -2485,6 +2562,7 @@
             }
         }
         static prefillMarketplacePurchaseModal() {
+            if (!this.isPanelVisible()) { this.suspendPanelWork(); return false; }
             let target = MWI_Calculator_Calculator.marketAutoFillTarget;
             if (target && Date.now() > target.expiresAt) {
                 MWI_Calculator_Calculator.marketAutoFillTarget = null;
@@ -2593,14 +2671,20 @@
         // 初始化监听器
         static initialize() {
             let lastPanel = null;
-            const observer = new MutationObserver(() => {
+            let frame = null;
+            const observer = new MutationObserver(records => {
+                if (document.hidden || records.every(record => record.target.closest?.('#mwi-calculator-panel'))) return;
+                if (frame) return;
+                frame = requestAnimationFrame(() => {
+                frame = null;
                 const panel = document.querySelector('[class^="SkillActionDetail_regularComponent"]');
                 if (panel && panel !== lastPanel) {
                     lastPanel = panel;
                     setTimeout(() => {
-                        MWI_Calculator_ActionDetailPlus.enhanceSkillActionDetail();
+                        if (panel.isConnected && !document.hidden) MWI_Calculator_ActionDetailPlus.enhanceSkillActionDetail();
                     }, 50);
                 }
+                });
             });
             observer.observe(document.body, { childList: true, subtree: true });
         }
@@ -2935,6 +3019,12 @@
         }
         // 获取物品配方
         static tryGetRecipe(itemHrid) {
+            const cache = this.renderRecipeCache;
+            if (!cache) return this.buildRecipe(itemHrid);
+            if (!cache.has(itemHrid)) cache.set(itemHrid, this.buildRecipe(itemHrid));
+            return cache.get(itemHrid);
+        }
+        static buildRecipe(itemHrid) {
             const itemName = itemHrid.split('/').pop() || '';
             // 检查商店兑换
             const shopHrid = `/shop_items/${itemName}`;
@@ -3363,12 +3453,16 @@
             if (!endCharacterItems) {
                 return;
             }
+            let changed = false;
             for (const item of endCharacterItems) {
                 if (!MWI_Calculator_ItemsMap.map.has(item.itemHrid)) {
                     MWI_Calculator_ItemsMap.map.set(item.itemHrid, new Map());
                 }
-                MWI_Calculator_ItemsMap.map.get(item.itemHrid).set(item.enhancementLevel, item.count);
+                const levels = MWI_Calculator_ItemsMap.map.get(item.itemHrid);
+                if (levels.get(item.enhancementLevel) !== item.count) changed = true;
+                levels.set(item.enhancementLevel, item.count);
             }
+            if (!changed) return;
             MWI_Calculator_ItemsMap.itemsUpdatedCallbacks.forEach(cb => {
                 try {
                     cb(endCharacterItems);
