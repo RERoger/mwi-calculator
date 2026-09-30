@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         [银河奶牛]生产制作计算器
-// @version      0.1.4
+// @version      0.1.5
 // @namespace    http://tampermonkey.net/
 // @description  银河奶牛计算器，自动计算需求缺口，一键跳转到制作、购买。Calculator for MilkyWayIdle，Automatically calculate supply-demand gaps and navigate to production or purchasing with a single click.
 // @author       RERoger
@@ -2700,6 +2700,7 @@
             MWI_Calculator_ActionDetailPlus.createOutputItemComponents(outputItems);
             // 联动
             let linking = false;
+            let editingOutput = null;
             function updateSkillActionDetail(e) {
                 if (linking)
                     return;
@@ -2713,7 +2714,7 @@
                 }
                 const skillActionTimes = parseInt(skillActionTimeInput.value, 10);
                 MWI_Calculator_ActionDetailPlus.outputItemComponents.forEach(component => {
-                    if (component.outputItemInput !== target) {
+                    if (component.outputItemInput !== target && component.outputItemInput !== editingOutput) {
                         component.outputItemInput.value = (isNaN(skillActionTimes)) ? '∞' : Math.ceil(skillActionTimes * component.count).toString();
                     }
                 });
@@ -2761,7 +2762,9 @@
             let refreshFramePending = false;
             let pendingTarget = skillActionTimeInput;
             const scheduleSkillActionDetailRefresh = (target = skillActionTimeInput) => {
-                pendingTarget = target || skillActionTimeInput;
+                // 程序更新次数所派发的 React input/change 不再反向排队覆盖产出输入。
+                if (linking) return;
+                pendingTarget = editingOutput || target || skillActionTimeInput;
                 if (refreshFramePending)
                     return;
                 refreshFramePending = true;
@@ -2779,8 +2782,16 @@
             skillActionTimeInput.addEventListener('input', event => scheduleSkillActionDetailRefresh(event.target));
             skillActionTimeInput.addEventListener('change', event => scheduleSkillActionDetailRefresh(event.target));
             MWI_Calculator_ActionDetailPlus.outputItemComponents.forEach(component => {
-                component.outputItemInput.addEventListener('input', event => scheduleSkillActionDetailRefresh(event.target));
-                component.outputItemInput.addEventListener('change', event => scheduleSkillActionDetailRefresh(event.target));
+                const input = component.outputItemInput;
+                input.addEventListener('focus', () => { editingOutput = input; });
+                input.addEventListener('input', event => scheduleSkillActionDetailRefresh(event.target));
+                input.addEventListener('change', event => scheduleSkillActionDetailRefresh(event.target));
+                input.addEventListener('blur', () => {
+                    // 先消化最后一次输入（可能尚未执行到下一帧），再允许自身取整回写。
+                    updateSkillActionDetail({ target: input });
+                    if (editingOutput === input) editingOutput = null;
+                    scheduleSkillActionDetailRefresh(skillActionTimeInput);
+                });
             });
             skillActionTimeButtons.forEach(btn => {
                 btn.addEventListener('click', () => {
