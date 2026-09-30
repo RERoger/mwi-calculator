@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         [银河奶牛]生产制作计算器
-// @version      0.1.5
+// @version      0.1.6
 // @namespace    http://tampermonkey.net/
 // @description  银河奶牛计算器，自动计算需求缺口，一键跳转到制作、购买。Calculator for MilkyWayIdle，Automatically calculate supply-demand gaps and navigate to production or purchasing with a single click.
 // @author       RERoger
@@ -396,6 +396,9 @@
             this.requiredItemsMap.forEach(item => item.removeDisplayElement());
             this.targetItemsMap.clear();
             this.requiredItemsMap.clear();
+            this.downgradeRows?.forEach(row => row.element.remove());
+            this.downgradeRows?.clear();
+            if (this.downgradeDetails) this.downgradeDetails.hidden = true;
             this.targetItemCategoryMap.forEach(category => { category.needCalc = true; });
             for (const map of [this.targetItemDetailsMap, this.shortageItemDetailsMap, this.requiredItemDetailsMap]) {
                 map.forEach(details => { details.open = true; details.hidden = true; });
@@ -899,52 +902,70 @@
             }, 300);
         }
         // 计算所有所需材料
-        static calculateAllRequiredItems(inventoryMap) {
+        static calculateAllRequiredItems(inventoryMap, { enhancedInventory = null, downgradeItems = null } = {}) {
             const result = new Map();
             const queueMap = new Map();
-            MWI_Calculator_Calculator.targetItemsMap.forEach(targetItem => {
-                if (targetItem.needCalc && this.targetItemCategoryMap.get(targetItem.categoryHrid)?.needCalc) {
-                    if (targetItem.itemHrid.includes('/house_rooms/')) {
-                        // 处理房屋建造成本
-                        const characterHouseRoomLevel = MWI_Calculator.gameObject.state.characterHouseRoomDict?.[targetItem.itemHrid]?.level || 0;
-                        const upgradeCostsMap = MWI_Calculator.initClientData?.houseRoomDetailMap?.[targetItem.itemHrid]?.upgradeCostsMap;
-                        for (let i = characterHouseRoomLevel + 1; i <= targetItem.count && i <= 8; i++) {
-                            upgradeCostsMap[i].forEach(costItem => {
-                                queueMap.set(costItem.itemHrid, (queueMap.get(costItem.itemHrid) || 0) + costItem.count);
-                            });
-                        }
-                    }
-                    else if (targetItem.count < 0) {
-                        inventoryMap.set(targetItem.itemHrid, (inventoryMap.get(targetItem.itemHrid) || 0) - targetItem.count);
-                    }
-                    else {
-                        queueMap.set(targetItem.itemHrid, (queueMap.get(targetItem.itemHrid) || 0) + targetItem.count);
+            // 各用途分别计数，但同一物品仍合并展开配方，避免重复取整。
+            const enqueue = (itemHrid, count, purpose = 'material') => {
+                if (!(count > 0)) return;
+                if (!queueMap.has(itemHrid)) queueMap.set(itemHrid, { target: 0, material: 0, upgrade: 0 });
+                queueMap.get(itemHrid)[purpose] += count;
+            };
+            // 使用副本共享扣减，A/B及不同配方之间不会重复占用同一件强化装备。
+            const enhanced = new Map([...(enhancedInventory || new Map())].map(([hrid, levels]) =>
+                [hrid, new Map([...levels].filter(([level, count]) => Number.isInteger(level) && level > 0 && Number.isFinite(count) && count > 0)
+                    .sort(([a], [b]) => a - b))]));
+            const useEnhanced = (itemHrid, need, needsDowngrade) => {
+                let remaining = need;
+                for (const [level, available] of enhanced.get(itemHrid) || []) {
+                    if (!(remaining > 0)) break;
+                    const used = Math.min(Math.floor(available), Math.ceil(remaining));
+                    if (!(used > 0)) continue;
+                    enhanced.get(itemHrid).set(level, available - used);
+                    remaining = Math.max(0, remaining - used);
+                    if (needsDowngrade && downgradeItems) {
+                        const key = `${itemHrid}:${level}`;
+                        const previous = downgradeItems.get(key);
+                        downgradeItems.set(key, { itemHrid, enhancementLevel: level, count: (previous?.count || 0) + used });
                     }
                 }
+                return remaining;
+            };
+            this.targetItemsMap.forEach(targetItem => {
+                if (!targetItem.needCalc || !this.targetItemCategoryMap.get(targetItem.categoryHrid)?.needCalc) return;
+                if (targetItem.itemHrid.includes('/house_rooms/')) {
+                    const currentLevel = MWI_Calculator.gameObject.state.characterHouseRoomDict?.[targetItem.itemHrid]?.level || 0;
+                    const costs = MWI_Calculator.initClientData?.houseRoomDetailMap?.[targetItem.itemHrid]?.upgradeCostsMap;
+                    for (let i = currentLevel + 1; i <= targetItem.count && i <= 8; i++) {
+                        costs[i].forEach(item => enqueue(item.itemHrid, item.count));
+                    }
+                } else if (targetItem.count < 0) {
+                    inventoryMap.set(targetItem.itemHrid, (inventoryMap.get(targetItem.itemHrid) || 0) - targetItem.count);
+                } else enqueue(targetItem.itemHrid, targetItem.count, 'target');
             });
             while (queueMap.size > 0) {
-                const [itemHrid, need] = queueMap.entries().next().value;
+                const [itemHrid, needs] = queueMap.entries().next().value;
                 queueMap.delete(itemHrid);
-                const have = inventoryMap.get(itemHrid) || 0;
-                const use = Math.min(have, need);
-                if (use > 0) {
-                    inventoryMap.set(itemHrid, have - use);
+                // 0级先满足目标和普通材料；强化库存优先留给可直接继承强化的升级基底。
+                let available = Math.max(0, inventoryMap.get(itemHrid) || 0);
+                for (const purpose of ['target', 'material', 'upgrade']) {
+                    const used = Math.min(available, needs[purpose]);
+                    available -= used;
+                    needs[purpose] -= used;
                 }
-                const remain = need - use;
-                if (remain > 0) {
-                    result.set(itemHrid, (result.get(itemHrid) || 0) + remain);
-                    const recipe = MWI_Calculator_ActionDetailPlus.tryGetRecipe(itemHrid);
-                    if (!recipe)
-                        continue;
-                    const redundant = MWI_Calculator_Calculator.materialPlanningMode === 'redundant';
-                    // 冗余模式与跳转制作使用相同的产出修正，再逐层展开材料。
-                    const times = MWI_Calculator_Calculator.getProductionActionCount(recipe, remain);
-                    for (const input of recipe.inputs) {
-                        const amount = redundant
-                            ? MWI_Calculator_Calculator.getMaterialBudget(input.count, times, input.consumptionVariance || 0)
-                            : input.count * times;
-                        queueMap.set(input.itemHrid, (queueMap.get(input.itemHrid) || 0) + amount);
-                    }
+                inventoryMap.set(itemHrid, available);
+                needs.upgrade = useEnhanced(itemHrid, needs.upgrade, false);
+                needs.material = useEnhanced(itemHrid, needs.material, true);
+                const remain = needs.target + needs.material + needs.upgrade;
+                if (!(remain > 0)) continue;
+                result.set(itemHrid, (result.get(itemHrid) || 0) + remain);
+                const recipe = MWI_Calculator_ActionDetailPlus.tryGetRecipe(itemHrid);
+                if (!recipe) continue;
+                const redundant = this.materialPlanningMode === 'redundant';
+                const times = this.getProductionActionCount(recipe, remain);
+                for (const input of recipe.inputs) {
+                    const amount = redundant ? this.getMaterialBudget(input.count, times, input.consumptionVariance || 0) : input.count * times;
+                    enqueue(input.itemHrid, amount, input.isUpgradeBase ? 'upgrade' : 'material');
                 }
             }
             return result;
@@ -1067,6 +1088,19 @@
                 #mwi-calculator-panel input.mwi-category-quantity::-webkit-inner-spin-button,
                 #mwi-calculator-panel input.mwi-category-quantity::-webkit-outer-spin-button {
                     -webkit-appearance:none; margin:0;
+                }
+                #mwi-calculator-panel .mwi-downgrade-section {
+                    background:rgb(207,149,62); border-radius:4px; padding:2px;
+                }
+                #mwi-calculator-panel .mwi-downgrade-section > summary {
+                    background:rgb(251,181,75); color:#2c2e45; border-radius:4px; padding:2px 6px; font-size:14px; text-align:left; cursor:pointer;
+                }
+                #mwi-calculator-panel .mwi-downgrade-item {
+                    background:${MWI_Calculator_UITheme.surface}; color:#e7e7e7;
+                    font:inherit; white-space:nowrap;
+                }
+                #mwi-calculator-panel .mwi-downgrade-item .mwi-downgrade-level {
+                    color:rgb(251,181,75);
                 }
                 /* 目标清单行：数量完整，操作区固定，只有名称占用剩余空间。 */
                 #mwi-calculator-panel .mwi-target-row {
@@ -1350,6 +1384,7 @@
             rightDiv.style.padding = '0px 2px';
             rightDiv.appendChild(MWI_Calculator_Calculator.createMaterialPlanningModeSelector());
             rightDiv.appendChild(MWI_Calculator_Calculator.createHouseAcquisitionModeSelector());
+            rightDiv.appendChild(this.createDowngradeSection());
             const shortageItemDetails = document.createElement('details');
             shortageItemDetails.style.background = '#902f10';
             shortageItemDetails.style.borderRadius = '4px';
@@ -2176,7 +2211,11 @@
             });
             const inventoryMap = MWI_Calculator_ItemsMap.getInventoryMap();
             const totalNeeds = MWI_Calculator_Calculator.calculateAllRequiredItems(new Map());
-            const remainNeeds = MWI_Calculator_Calculator.calculateAllRequiredItems(inventoryMap);
+            const downgradeItems = new Map();
+            const remainNeeds = this.calculateAllRequiredItems(inventoryMap, {
+                enhancedInventory: MWI_Calculator_ItemsMap.getEnhancedInventoryMap(), downgradeItems
+            });
+            this.renderDowngradeItems(downgradeItems);
             // 移除不存在的物品
             [...MWI_Calculator_Calculator.requiredItemsMap.keys()].forEach(itemHrid => {
                 if (!totalNeeds.has(itemHrid)) {
@@ -2285,8 +2324,109 @@
             MWI_Calculator_UI.attachTargetLayout(container, itemContainer, rightDiv, ownedSpan, targetInput, removeButton);
             targetInput.addEventListener('input', () => MWI_Calculator_UI.scheduleTargetLayout(container));
         }
+        static createDowngradeSection() {
+            const details = document.createElement('details');
+            details.className = 'mwi-downgrade-section';
+            details.hidden = true;
+            details.open = true;
+            const summary = document.createElement('summary');
+            summary.textContent = MWI_Calculator_I18n.isChinese() ? '强化降级' : 'Enhancement downgrade';
+            details.appendChild(summary);
+            // 虚拟分类仅承载圆角底框，不增加分类标题或折叠操作。
+            const itemsContainer = document.createElement('div');
+            itemsContainer.className = 'mwi-downgrade-items';
+            Object.assign(itemsContainer.style, MWI_Calculator_UIStyles.category);
+            details.appendChild(itemsContainer);
+            this.downgradeItemsContainer = itemsContainer;
+            this.downgradeDetails = details;
+            this.downgradeRows = new Map();
+            return details;
+        }
+        static renderDowngradeItems(items) {
+            if (!this.downgradeDetails) return;
+            for (const [key, row] of this.downgradeRows) {
+                if (!items.has(key)) { row.element.remove(); this.downgradeRows.delete(key); }
+            }
+            const sorted = [...items.entries()].sort(([, a], [, b]) =>
+                MWI_Calculator_Utils.getSortIndexByItemHrid(a.itemHrid) - MWI_Calculator_Utils.getSortIndexByItemHrid(b.itemHrid)
+                || a.itemHrid.localeCompare(b.itemHrid) || a.enhancementLevel - b.enhancementLevel);
+            let previous = null;
+            for (const [key, item] of sorted) {
+                let row = this.downgradeRows.get(key);
+                if (!row) {
+                    // 复用缺口物品行，保持图标、名称、数量框及间距一致。
+                    const displayItem = {
+                        iconHref: MWI_Calculator_Utils.getIconHrefByItemHrid(item.itemHrid),
+                        displayName: MWI_Calculator_I18n.getItemName(item.itemHrid),
+                    };
+                    this.createShortageItemDisplayElement(displayItem, () => this.gotoDowngradeEnhancing(item));
+                    const element = displayItem.shortageDisplayElement;
+                    element.classList.add('mwi-downgrade-item');
+                    const label = displayItem.itemJumpButton.querySelector('span');
+                    label.classList.add('mwi-downgrade-name');
+                    const level = document.createElement('span');
+                    level.className = 'mwi-downgrade-level';
+                    level.textContent = `+${item.enhancementLevel}`;
+                    const itemContainer = displayItem.itemJumpButton.firstElementChild;
+                    // 图标固定、名称可收缩、等级按内容宽度保留；短名称不占满余宽。
+                    itemContainer.style.display = 'flex';
+                    itemContainer.style.justifyContent = 'flex-start';
+                    itemContainer.style.textAlign = 'left';
+                    itemContainer.firstElementChild.style.flex = '0 0 22px';
+                    label.style.flex = '0 1 auto';
+                    label.style.textAlign = 'left';
+                    displayItem.itemJumpButton.style.justifyContent = 'flex-start';
+                    displayItem.itemJumpButton.style.flex = '1 1 0';
+                    level.style.flex = '0 0 auto';
+                    level.style.maxWidth = 'none';
+                    level.style.marginLeft = '2px';
+                    level.style.whiteSpace = 'nowrap';
+                    level.style.overflow = 'visible';
+                    level.style.textOverflow = 'clip';
+                    level.style.textAlign = 'left';
+                    itemContainer.appendChild(level);
+                    const quantity = displayItem.shortageSpan;
+                    quantity.classList.add('mwi-downgrade-count');
+                    row = { element, quantity };
+                    this.downgradeRows.set(key, row);
+                }
+                const equippedNeeded = Math.max(0, item.count - MWI_Calculator_ItemsMap.getInventoryOnlyCount(item.itemHrid, item.enhancementLevel));
+                const title = `${MWI_Calculator_I18n.getItemName(item.itemHrid)} +${item.enhancementLevel}`
+                    + (equippedNeeded > 0 ? `（其中 ${equippedNeeded} 件已装备，请先手动卸下）` : '');
+                if (row.element.title !== title) row.element.title = title;
+                const text = MWI_Calculator_Utils.formatNumber(item.count);
+                if (row.quantity.textContent !== text) row.quantity.textContent = text;
+                if (previous) {
+                    if (previous.nextElementSibling !== row.element) previous.insertAdjacentElement('afterend', row.element);
+                } else if (this.downgradeItemsContainer.firstElementChild !== row.element) {
+                    this.downgradeItemsContainer.prepend(row.element);
+                }
+                previous = row.element;
+            }
+            this.downgradeDetails.hidden = sorted.length === 0;
+        }
+        static gotoDowngradeEnhancing(item) {
+            if (!this.canUseCharacterData()) return false;
+            const game = MWI_Calculator.getGameObject() || MWI_Calculator.gameObject;
+            if (this.normalizeCharacterID(game?.state?.character?.id) !== this.activeCharacterID) return false;
+            // 使用游戏真实库存hash（含角色、库存位置、物品及强化等级），不猜测参数。
+            for (const [hash, owned] of game?.state?.characterItemMap || []) {
+                if (owned.itemHrid === item.itemHrid && owned.enhancementLevel === item.enhancementLevel
+                    && owned.itemLocationHrid === '/item_locations/inventory' && owned.count > 0
+                    && typeof game.handleEnhanceItem === 'function') {
+                    game.handleEnhanceItem(hash);
+                    return true;
+                }
+            }
+            const equipped = [...(game?.state?.characterItemMap?.values() || [])].some(owned =>
+                owned.itemHrid === item.itemHrid && owned.enhancementLevel === item.enhancementLevel && owned.count > 0
+                && owned.itemLocationHrid !== '/item_locations/inventory' && MWI_Calculator_ItemsMap.isMaterialLocation(owned.itemLocationHrid));
+            if (equipped) alert('该材料当前已装备，请先手动卸下，再点击进入强化界面。');
+            else console.warn('[MWI_Calculator] 强化跳转目标已不在库存或游戏接口未就绪');
+            return false;
+        }
         // 创建缺口物品元素
-        static createShortageItemDisplayElement(requiredItem) {
+        static createShortageItemDisplayElement(requiredItem, onNavigate = null) {
             const { container, itemContainer, leftDiv, rightDiv } = MWI_Calculator_Calculator.createBaseItemDisplayItem(requiredItem);
             // 将图标和名称包裹在可点击按钮中，按“制作/购买”枚举跳转
             const itemJumpButton = document.createElement('button');
@@ -2322,6 +2462,7 @@
             itemJumpButton.appendChild(itemContainer);
             container.insertBefore(itemJumpButton, container.firstChild);
             itemJumpButton.addEventListener('click', () => {
+                if (onNavigate) { onNavigate(); return; }
                 if (MWI_Calculator_Calculator.houseAcquisitionMode === 'buy') {
                     MWI_Calculator_Calculator.TryGotoMarketplaceByRequiredItem(requiredItem);
                 }
@@ -3057,7 +3198,7 @@
                     // 复用 MWI_Calculator_ActionDetailPlus 的计算逻辑以获得输入/输出（考虑茶水等加成在 calculateRequiredItems 中已处理）
                     const { upgradeItemHrid, inputItems, outputItems } = MWI_Calculator_ActionDetailPlus.calculateActionDetail(actionHrid);
                     if (upgradeItemHrid) {
-                        inputItems.push({ itemHrid: upgradeItemHrid, count: 1 });
+                        inputItems.push({ itemHrid: upgradeItemHrid, count: 1, isUpgradeBase: true });
                     } // 升级物品固定需求数量1，添加到输入中
                     let outputCount = 1;
                     if (outputItems && outputItems.length > 0) {
@@ -3437,6 +3578,20 @@
         static getCount(itemHrid, enhancementLevel = 0) {
             return MWI_Calculator_ItemsMap.map.get(itemHrid)?.get(enhancementLevel) ?? 0;
         }
+        static getEnhancedInventoryMap() {
+            const result = new Map();
+            for (const [hrid, levels] of this.map) {
+                const enhanced = new Map([...levels].filter(([level, count]) => level > 0 && count > 0));
+                if (enhanced.size) result.set(hrid, enhanced);
+            }
+            return result;
+        }
+        static getInventoryOnlyCount(itemHrid, level = 0) {
+            return this.locationItems?.get(itemHrid)?.get('/item_locations/inventory')?.get(level) || 0;
+        }
+        static isMaterialLocation(location) {
+            return location === '/item_locations/inventory' || /^\/item_locations\/(two_hand|main_hand|off_hand|back|head|body|legs|hands|feet|pouch|neck|earrings|ring|charm|trinket|milking_tool|foraging_tool|woodcutting_tool|cheesesmithing_tool|crafting_tool|tailoring_tool|cooking_tool|brewing_tool|alchemy_tool|enhancing_tool)$/.test(location);
+        }
         // 获取所有物品数量
         static getInventoryMap() {
             const inventoryMap = new Map();
@@ -3465,13 +3620,33 @@
                 return;
             }
             let changed = false;
+            this.locationItems ||= new Map();
+            const touched = new Set();
             for (const item of endCharacterItems) {
-                if (!MWI_Calculator_ItemsMap.map.has(item.itemHrid)) {
-                    MWI_Calculator_ItemsMap.map.set(item.itemHrid, new Map());
+                const location = item.itemLocationHrid || '/item_locations/inventory';
+                const level = item.enhancementLevel;
+                if (!this.isMaterialLocation(location) || !Number.isInteger(level) || level < 0 || !Number.isFinite(item.count)) continue;
+                if (!this.locationItems.has(item.itemHrid)) this.locationItems.set(item.itemHrid, new Map());
+                const locations = this.locationItems.get(item.itemHrid);
+                if (!locations.has(location)) locations.set(location, new Map());
+                const levels = locations.get(location);
+                const count = Math.max(0, item.count);
+                // 位置变化即使不改变总数也通知刷新（强化跳转/卸装提示需要最新位置）。
+                if ((levels.get(level) || 0) !== count) changed = true;
+                if (count > 0) levels.set(level, count);
+                else levels.delete(level);
+                if (!levels.size) locations.delete(location);
+                if (!locations.size) this.locationItems.delete(item.itemHrid);
+                touched.add(item.itemHrid);
+            }
+            // 同一批穿脱消息全部处理完后汇总，避免仓库与装备槽互相覆盖。
+            for (const hrid of touched) {
+                const totals = new Map();
+                for (const levels of this.locationItems.get(hrid)?.values() || []) {
+                    for (const [level, count] of levels) totals.set(level, (totals.get(level) || 0) + count);
                 }
-                const levels = MWI_Calculator_ItemsMap.map.get(item.itemHrid);
-                if (levels.get(item.enhancementLevel) !== item.count) changed = true;
-                levels.set(item.enhancementLevel, item.count);
+                if (totals.size) this.map.set(hrid, totals);
+                else this.map.delete(hrid);
             }
             if (!changed) return;
             MWI_Calculator_ItemsMap.itemsUpdatedCallbacks.forEach(cb => {
@@ -3486,6 +3661,7 @@
         // 清空物品数据
         static clear() {
             MWI_Calculator_ItemsMap.map.clear();
+            this.locationItems?.clear();
         }
     }
     /** 物品数据映射表：itemHrid -> (enhancementLevel -> count) */
