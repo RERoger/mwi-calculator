@@ -11,6 +11,7 @@
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=milkywayidle.com
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        GM_setClipboard
 // @run-at       document-body
 // @license      MIT
 // @require      https://cdn.jsdelivr.net/npm/lz-string@1.5.0/libs/lz-string.min.js
@@ -403,6 +404,9 @@
             for (const map of [this.targetItemDetailsMap, this.shortageItemDetailsMap, this.requiredItemDetailsMap]) {
                 map.forEach(details => { details.open = true; details.hidden = true; });
             }
+            // 已应用预设的类随角色切换一并移除（新角色的 targetItemsMap 会整体替换，无需恢复勾选）
+            this.presetAppliedMap?.forEach(applied => applied.details.remove());
+            this.presetAppliedMap?.clear();
         }
         static prepareCharacterSession(characterID) {
             const id = this.normalizeCharacterID(characterID);
@@ -609,6 +613,10 @@
                     else this.targetItemCategoryMap.set(category.categoryHrid, new TargetItemCategory(category.categoryHrid, enabled));
                 }
                 this.restoreDetailsOpenState(storageKey.replace('TargetItems', 'DetailsOpenState'));
+                this.loadPresets();
+                this.loadAppliedPresets();
+                this.refreshPresetOptions();
+                // 渲染放在预设恢复之后，缺口计算才能包含已应用的预设物品
                 this.renderItemsDisplay();
                 this.characterDataLoaded = true;
                 return true;
@@ -754,6 +762,48 @@
                 return { added, kept };
             });
         }
+        // UID 拷贝时同步导入源角色的预设：
+        // overwrite = 用源角色预设整体替换；merge = 只新增当前缺少的预设（按名称）。
+        static importPresetsFromCharacter(sourceID, mode) {
+            const sourceKey = this.getStorageKey(sourceID);
+            if (!sourceKey) return { added: 0, kept: 0, total: 0 };
+            let loaded;
+            try {
+                loaded = JSON.parse(GM_getValue(sourceKey.replace('TargetItems', 'Presets'), '[]'));
+            }
+            catch (error) {
+                console.error('[MWI_Calculator] 源角色预设读取失败', error);
+                loaded = [];
+            }
+            if (!Array.isArray(loaded)) loaded = [];
+            const valid = [];
+            for (const preset of loaded) {
+                if (!preset || typeof preset.name !== 'string' || !preset.name) continue;
+                if (!Array.isArray(preset.items)) continue;
+                const items = [];
+                for (const item of preset.items) {
+                    if (!item || typeof item.itemHrid !== 'string' || !Number.isFinite(item.count)) continue;
+                    items.push({ itemHrid: item.itemHrid, count: item.count });
+                }
+                valid.push({ name: preset.name, items, alertRatio: preset.alertRatio });
+            }
+            let added = 0, kept = 0;
+            if (mode === 'overwrite') {
+                this.presetMap.clear();
+                for (const preset of valid) this.presetMap.set(preset.name, { items: preset.items, alertRatio: this.normalizeAlertRatio(preset.alertRatio) });
+                added = valid.length;
+            }
+            else {
+                for (const preset of valid) {
+                    if (this.presetMap.has(preset.name)) { kept++; continue; }
+                    this.presetMap.set(preset.name, { items: preset.items, alertRatio: this.normalizeAlertRatio(preset.alertRatio) });
+                    added++;
+                }
+            }
+            this.savePresets();
+            this.refreshPresetOptions();
+            return { added, kept, total: valid.length };
+        }
         static async chooseImportMode(sourceID) {
             if (!this.canUseCharacterData() || this.importDialogPending) return false;
             const destinationID = this.activeCharacterID;
@@ -766,12 +816,19 @@
                 if (!this.canUseCharacterData() || this.activeCharacterID !== destinationID
                     || this.characterGeneration !== generation) return false;
                 if (!this.backupCurrentListBeforeImport()) return false;
+                // 覆盖导入前先整体取消已应用的预设，避免应用状态与导入后的清单错位
+                if (mode === 'overwrite') {
+                    [...this.presetAppliedMap.keys()].forEach(appliedName => this.removeAppliedPreset(appliedName));
+                }
                 const result = mode === 'overwrite'
                     ? this.runImportTransaction(() => this.loadCalculatorData(sourceID, { importToCurrent: true }))
                     : this.mergeItemsFromCharacter(sourceID);
                 if (!result) { alert('导入失败，未完成保存；请检查控制台，确认原清单后重试。'); return false; }
-                alert(mode === 'overwrite' ? `已用角色 ${sourceID} 的清单覆盖当前清单`
-                    : `合并导入完成：新增 ${result.added} 项，已存在 ${result.kept} 项保持不变`);
+                // 同步导入源角色的预设：覆盖 = 整体替换，合并 = 只新增缺少的预设
+                const presetResult = this.importPresetsFromCharacter(sourceID, mode);
+                alert(mode === 'overwrite'
+                    ? `已用角色 ${sourceID} 的清单覆盖当前清单；预设已同步覆盖（源角色共 ${presetResult.total} 个）`
+                    : `合并导入完成：新增 ${result.added} 项，已存在 ${result.kept} 项保持不变；预设新增 ${presetResult.added} 个，已存在 ${presetResult.kept} 个保持不变`);
                 return true;
             }
             catch (error) { console.error('[MWI_Calculator] 导入失败', error); return false; }
@@ -943,6 +1000,27 @@
                     inventoryMap.set(targetItem.itemHrid, (inventoryMap.get(targetItem.itemHrid) || 0) - targetItem.count);
                 } else enqueue(targetItem.itemHrid, targetItem.count, 'target');
             });
+            // 已应用的预设物品并入缺口计算：本地数量低于需求数量时同样产生缺口；
+            // 同一物品在原目标/多个预设间重合时，仅保留需求数量最高者的缺口。
+            if (this.presetAppliedMap?.size > 0) {
+                const presetMax = new Map();
+                this.presetAppliedMap.forEach(applied => {
+                    for (const row of applied.rows || []) {
+                        const item = row.item;
+                        if (row.checked === false) continue;
+                        if (!item?.itemHrid || !(item.count > 0)) continue;
+                        if (item.count > (presetMax.get(item.itemHrid) || 0)) presetMax.set(item.itemHrid, item.count);
+                    }
+                });
+                presetMax.forEach((count, itemHrid) => {
+                    const target = this.targetItemsMap.get(itemHrid);
+                    const targetActive = Boolean(target && target.needCalc
+                        && this.targetItemCategoryMap.get(target.categoryHrid)?.needCalc
+                        && !target.itemHrid.includes('/house_rooms/'));
+                    if (targetActive && target.count >= count) return;
+                    enqueue(itemHrid, targetActive ? count - target.count : count, 'target');
+                });
+            }
             while (queueMap.size > 0) {
                 const [itemHrid, needs] = queueMap.entries().next().value;
                 queueMap.delete(itemHrid);
@@ -1355,8 +1433,12 @@
             leftDiv.style.padding = '0px 2px';
             leftDiv.appendChild(MWI_Calculator_Calculator.createHouseRoomSelectionComponent());
             leftDiv.appendChild(MWI_Calculator_Calculator.createCategoryAddComponent());
+            // 预设选择区域：与「选择房屋」「选择大类」添加行同级
+            leftDiv.appendChild(MWI_Calculator_Calculator.createPresetSelectionComponent());
             leftDiv.appendChild(MWI_Calculator_Calculator.createItemSearchComponent());
             MWI_Calculator_Calculator.createItemDetailsMap(leftDiv, MWI_Calculator_Calculator.targetItemDetailsMap);
+            // 预设应用容器：已应用的预设类建立在此（与原大类 details 同层级）
+            MWI_Calculator_Calculator.presetDetailsHost = leftDiv;
             calculatorPanel.appendChild(leftDiv);
             MWI_Calculator_Calculator.targetItemDetailsMap.forEach((details, categoryHrid) => {
                 const summary = details.querySelector('summary');
@@ -1444,6 +1526,8 @@
             houseSection.appendChild(MWI_Calculator_Calculator.createHouseRoomSelectionComponent());
             addItemSection.appendChild(houseSection);
             addItemSection.appendChild(MWI_Calculator_Calculator.createCategoryAddComponent());
+            // 预设选择区域：与「选择房屋」「选择大类」添加行同级
+            addItemSection.appendChild(MWI_Calculator_Calculator.createPresetSelectionComponent());
             // 物品搜索区域
             const itemSection = document.createElement('div');
             itemSection.style.width = '100%';
@@ -1451,6 +1535,995 @@
             itemSection.appendChild(searchContainer);
             addItemSection.appendChild(itemSection);
             return addItemSection;
+        }
+        // 创建预设选择组件：与「选择房屋」「选择大类」同级。
+        // 点击展开下拉列表，列表最上端固定「管理预设」按钮；
+        // 点击后原位切换为「新增/保存/取消」三个管理按钮（事件暂留空，等待下一步实现）。
+        static createPresetSelectionComponent() {
+            const section = document.createElement('div');
+            section.style.background = MWI_Calculator_UITheme.surface;
+            section.style.border = 'none';
+            section.style.borderRadius = '4px';
+            section.style.padding = '4px';
+            section.style.margin = '2px';
+            section.style.display = 'flex';
+            section.style.flexDirection = 'column';
+            const dropdown = document.createElement('div');
+            dropdown.style.display = 'flex';
+            dropdown.style.minWidth = '20px';
+            dropdown.style.flex = '1';
+            dropdown.style.position = 'relative';
+            const selected = document.createElement('div');
+            selected.style.background = MWI_Calculator_UITheme.heading;
+            selected.style.color = MWI_Calculator_UITheme.onAction;
+            selected.style.borderRadius = '4px';
+            selected.style.paddingLeft = '4px';
+            selected.style.margin = '2px';
+            selected.style.minWidth = '40px';
+            selected.style.flex = '1';
+            selected.style.cursor = 'pointer';
+            selected.style.display = 'flex';
+            selected.style.alignItems = 'center';
+            selected.style.whiteSpace = 'nowrap';
+            selected.textContent = MWI_Calculator_I18n.isChinese() ? '选择预设' : 'Select preset';
+            const list = document.createElement('div');
+            list.style.background = MWI_Calculator_UITheme.surface;
+            list.style.borderRadius = '4px';
+            list.style.padding = '4px';
+            list.style.margin = '2px';
+            list.style.width = '150px';
+            list.style.maxHeight = '335px';
+            list.style.overflowY = 'auto';
+            list.style.zIndex = '1000';
+            list.style.display = 'none';
+            list.style.position = 'absolute';
+            list.style.left = '0px';
+            list.style.top = '32px';
+            // 管理区（固定在下拉列表最上端）：默认仅「管理预设」，进入管理模式后原位显示三个按钮
+            const manageArea = document.createElement('div');
+            manageArea.style.display = 'flex';
+            manageArea.style.marginBottom = '2px';
+            const manageButton = document.createElement('button');
+            manageButton.type = 'button';
+            manageButton.textContent = MWI_Calculator_I18n.isChinese() ? '管理预设' : 'Manage presets';
+            manageButton.style.cssText = 'flex:1;color:#fff;border:none;border-radius:4px;padding:4px;margin:2px;cursor:pointer';
+            manageButton.style.background = '#1976D2';
+            const editButtons = document.createElement('div');
+            editButtons.style.display = 'none';
+            editButtons.style.flex = '1';
+            const enterManageMode = () => {
+                MWI_Calculator_Calculator.presetManageMode = true;
+                manageButton.style.display = 'none';
+                editButtons.style.display = 'flex';
+                MWI_Calculator_Calculator.refreshPresetOptions();
+            };
+            const exitManageMode = () => {
+                MWI_Calculator_Calculator.presetManageMode = false;
+                editButtons.style.display = 'none';
+                manageButton.style.display = '';
+                MWI_Calculator_Calculator.refreshPresetOptions();
+            };
+            manageButton.addEventListener('click', (event) => {
+                event.stopPropagation();
+                enterManageMode();
+            });
+            const newPresetButton = document.createElement('button');
+            newPresetButton.type = 'button';
+            newPresetButton.textContent = MWI_Calculator_I18n.isChinese() ? '新增' : 'New';
+            newPresetButton.style.cssText = 'flex:1;color:#fff;border:none;border-radius:4px;padding:4px;margin:2px;cursor:pointer';
+            newPresetButton.style.background = '#4CAF50';
+            newPresetButton.addEventListener('click', (event) => {
+                event.stopPropagation();
+                exitManageMode();
+                MWI_Calculator_Calculator.closeCalculatorDropdowns();
+                MWI_Calculator_Calculator.showPresetEditorDialog();
+            });
+            const exitPresetButton = document.createElement('button');
+            exitPresetButton.type = 'button';
+            exitPresetButton.textContent = MWI_Calculator_I18n.isChinese() ? '退出' : 'Exit';
+            exitPresetButton.style.cssText = 'flex:1;color:#fff;border:none;border-radius:4px;padding:4px;margin:2px;cursor:pointer';
+            exitPresetButton.style.background = '#6B7280';
+            exitPresetButton.addEventListener('click', (event) => {
+                event.stopPropagation();
+                exitManageMode();
+            });
+            editButtons.append(newPresetButton, exitPresetButton);
+            manageArea.append(manageButton, editButtons);
+            // 预设选项容器：已保存的预设名称条目渲染在此处
+            const presetOptions = document.createElement('div');
+            MWI_Calculator_Calculator.presetOptionsContainer = presetOptions;
+            MWI_Calculator_Calculator.refreshPresetOptions();
+            list.appendChild(manageArea);
+            list.appendChild(presetOptions);
+            selected.addEventListener('click', (event) => {
+                event.stopPropagation();
+                // 每次展开下拉都重置为「管理预设」默认状态（即使上次关闭时处于新增/退出管理模式）
+                if (list.style.display !== 'block') exitManageMode();
+                MWI_Calculator_Calculator.toggleCalculatorDropdown(list);
+            });
+            MWI_Calculator_Calculator.registerCalculatorDropdown(dropdown, list);
+            dropdown.appendChild(selected);
+            dropdown.appendChild(list);
+            section.appendChild(dropdown);
+            return section;
+        }
+        // ── 预设（Presets）────────────────────────────────────────
+        // 预设存储键：与 TargetItems 同前缀、按角色 ID 区分
+        static getPresetsStorageKey() {
+            const key = this.getStorageKey();
+            return key ? key.replace('TargetItems', 'Presets') : null;
+        }
+        // 预警比例规范化：0~1 的小数，非法/缺失按 0 处理
+        static normalizeAlertRatio(value) {
+            const num = Number(value);
+            if (!Number.isFinite(num) || num <= 0) return 0;
+            return Math.min(num, 1);
+        }
+        // 从 GM 存储读取预设；无角色 ID 时清空内存预设
+        static loadPresets() {
+            this.presetMap ||= new Map();
+            this.presetMap.clear();
+            const key = this.getPresetsStorageKey();
+            if (!key) return false;
+            try {
+                // 从未保存过预设（键不存在）时写入 BUILTIN_PRESETS 并立即落盘锁定，
+                // 避免之后用户清空预设又被内置模板还原。
+                if (GM_getValue(key, null) == null) {
+                    for (const preset of this.BUILTIN_PRESETS || []) {
+                        if (!preset || typeof preset.name !== 'string' || !preset.name) continue;
+                        if (!Array.isArray(preset.items)) continue;
+                        const items = preset.items
+                            .filter(item => item && typeof item.itemHrid === 'string' && Number.isFinite(item.count))
+                            .map(item => ({ itemHrid: item.itemHrid, count: item.count }));
+                        if (items.length > 0) this.presetMap.set(preset.name, { items, alertRatio: this.normalizeAlertRatio(preset.alertRatio) });
+                    }
+                    if (this.presetMap.size > 0) this.savePresets();
+                    return this.presetMap.size > 0;
+                }
+                const loaded = JSON.parse(GM_getValue(key, '[]'));
+                if (!Array.isArray(loaded)) return false;
+                for (const preset of loaded) {
+                    if (!preset || typeof preset.name !== 'string' || !preset.name) continue;
+                    if (!Array.isArray(preset.items)) continue;
+                    const items = [];
+                    for (const item of preset.items) {
+                        if (!item || typeof item.itemHrid !== 'string' || !Number.isFinite(item.count)) continue;
+                        items.push({ itemHrid: item.itemHrid, count: item.count });
+                    }
+                    this.presetMap.set(preset.name, { items, alertRatio: this.normalizeAlertRatio(preset.alertRatio) });
+                }
+                return true;
+            }
+            catch (error) {
+                console.error('[MWI_Calculator] 预设加载失败', error);
+                return false;
+            }
+        }
+        // 预设写入 GM 存储；无角色 ID 时仅保留内存数据并提示
+        static savePresets() {
+            const key = this.getPresetsStorageKey();
+            if (!key) {
+                console.warn('[MWI_Calculator] 角色数据未就绪，预设暂存于内存，请稍后重新保存');
+                return false;
+            }
+            try {
+                const data = [...this.presetMap.entries()].map(([name, preset]) => ({ name, items: preset.items, alertRatio: this.normalizeAlertRatio(preset.alertRatio) }));
+                GM_setValue(key, JSON.stringify(data));
+                return true;
+            }
+            catch (error) {
+                console.error('[MWI_Calculator] 预设保存失败', error);
+                return false;
+            }
+        }
+        // 重建下拉列表中的预设名称条目：仅管理模式下点击名称打开编辑弹窗、
+        // 显示 "-" 删除按钮；普通模式（按钮为「管理预设」时）点击应用/取消应用预设。
+        // BUILTIN_PRESETS 中同名条目视为内置预设，始终显示在下拉列表底部。
+        static refreshPresetOptions() {
+            const container = this.presetOptionsContainer;
+            if (!container) return;
+            const zh = MWI_Calculator_I18n.isChinese();
+            const manageMode = this.presetManageMode === true;
+            const builtinPresets = this.BUILTIN_PRESETS || [];
+            const builtinNames = new Set(builtinPresets.map(preset => preset?.name).filter(Boolean));
+            container.innerHTML = '';
+            // 用户预设在上（按存储顺序），内置预设固定垫底（按模板顺序）
+            const userNames = [];
+            const builtinOrder = [];
+            for (const name of this.presetMap.keys()) {
+                if (builtinNames.has(name)) builtinOrder.push(name);
+                else userNames.push(name);
+            }
+            builtinOrder.sort((a, b) =>
+                builtinPresets.findIndex(preset => preset?.name === a)
+                - builtinPresets.findIndex(preset => preset?.name === b));
+            const renderEntry = (name, isBuiltin) => {
+                const option = document.createElement('div');
+                option.style.borderBottom = '1px solid #98a7e9';
+                option.style.borderRadius = '4px';
+                option.style.padding = '4px';
+                option.style.alignItems = 'center';
+                option.style.display = 'flex';
+                option.style.cursor = 'default';
+                const nameLabel = document.createElement('span');
+                nameLabel.textContent = isBuiltin ? `${name}（内置）` : name;
+                nameLabel.title = isBuiltin ? (zh ? '内置预设' : 'Built-in preset') : '';
+                nameLabel.style.cssText = 'flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+                if (manageMode) {
+                    nameLabel.style.cursor = 'pointer';
+                    nameLabel.addEventListener('click', (event) => {
+                        event.stopPropagation();
+                        MWI_Calculator_Calculator.closeCalculatorDropdowns();
+                        MWI_Calculator_Calculator.showPresetEditorDialog(name);
+                    });
+                    const deleteButton = document.createElement('button');
+                    deleteButton.type = 'button';
+                    deleteButton.textContent = '-';
+                    deleteButton.title = zh ? '删除预设' : 'Delete preset';
+                    deleteButton.style.cssText = 'flex:0 0 auto;margin-left:4px;color:#fff;border:none;border-radius:4px;padding:1px 7px;cursor:pointer;background:#c05621';
+                    deleteButton.addEventListener('click', (event) => {
+                        event.stopPropagation();
+                        if (!confirm(zh ? `确定删除预设「${name}」？` : `Delete preset "${name}"?`)) return;
+                        // 若该预设已应用，先移除其同层级类（会恢复此前被自动取消勾选的物品）
+                        this.removeAppliedPreset(name);
+                        this.presetMap.delete(name);
+                        this.savePresets();
+                        this.refreshPresetOptions();
+                    });
+                    option.append(nameLabel, deleteButton);
+                }
+                else {
+                    // 普通模式：点击名称应用/取消应用预设（建立同层级类并自动取消勾选重合项）
+                    nameLabel.style.cursor = 'pointer';
+                    nameLabel.addEventListener('click', (event) => {
+                        event.stopPropagation();
+                        MWI_Calculator_Calculator.applyPreset(name);
+                    });
+                    option.appendChild(nameLabel);
+                }
+                option.addEventListener('mouseenter', () => { option.style.background = '#4a4c6a'; });
+                option.addEventListener('mouseleave', () => { option.style.background = 'transparent'; });
+                container.appendChild(option);
+            };
+            for (const name of [...userNames, ...builtinOrder]) renderEntry(name, builtinNames.has(name));
+        }
+        // 普通模式点击预设名称：在原大类（食物/茶/咖啡等）同层级建立以预设命名的
+        // details 类，展示预设内全部物品与数量；与原大类重合的物品自动取消勾选
+        //（不再参与计算）。再次点击同一预设名称 = 取消应用并恢复勾选。
+        static applyPreset(name) {
+            if (this.presetAppliedMap.has(name)) {
+                this.removeAppliedPreset(name);
+                return;
+            }
+            const source = this.presetMap.get(name);
+            if (!source || !Array.isArray(source.items) || source.items.length === 0) return;
+            // 应用视图使用副本：行内改数量不影响预设数据，点保存才覆盖
+            this.applyPresetItems(name, source.items.map(entry => ({ ...entry })));
+        }
+        // 以给定物品列表建立应用视图（正常应用与刷新后恢复共用）
+        static applyPresetItems(name, items) {
+            if (this.presetAppliedMap.has(name)) return;
+            if (!items || items.length === 0) return;
+            const host = this.presetDetailsHost;
+            if (!host) return;
+            const checkedItems = [];
+            for (const item of items) {
+                const target = this.targetItemsMap.get(item.itemHrid);
+                if (target && target.needCalc) {
+                    target.needCalc = false;
+                    target.updateDisplayElement();
+                    checkedItems.push(item.itemHrid);
+                }
+            }
+            const zh = MWI_Calculator_I18n.isChinese();
+            const { details } = MWI_Calculator_UI.createCategory(name, null, null);
+            // 预设名字框（summary）内的保存按钮：行内数量被修改后显示，点击覆盖预设
+            const summary = details.querySelector('summary');
+            const saveButton = document.createElement('button');
+            saveButton.type = 'button';
+            saveButton.textContent = zh ? '保存' : 'Save';
+            saveButton.title = zh ? '将修改后的数量保存回预设' : 'Save modified counts back to preset';
+            saveButton.style.cssText = 'margin-left:6px;color:#fff;border:none;border-radius:4px;padding:1px 7px;cursor:pointer;background:#2e7d32;display:none';
+            summary.appendChild(saveButton);
+            // 名称右侧：预警状态（最低 现有/需求 与预警比例比较，绿=安全→自动折叠，红=预警→自动展开）
+            // + 最右侧补满按钮（与分类「清空」按钮同款角标布局）
+            const alertRatio = this.normalizeAlertRatio(this.presetMap.get(name)?.alertRatio);
+            Object.assign(summary.style, MWI_Calculator_UIStyles.summaryWithAction);
+            const statusSpan = document.createElement('span');
+            statusSpan.title = zh ? '当前最低 现有/需求 与预警比例的比较' : 'Min owned/required vs alert ratio';
+            statusSpan.style.cssText = 'margin-left:6px;font-weight:bold;white-space:nowrap';
+            summary.appendChild(statusSpan);
+            const fillButton = document.createElement('button');
+            fillButton.type = 'button';
+            fillButton.textContent = zh ? '补满' : 'Fill';
+            fillButton.title = zh ? '补满：全部勾选并计入缺口计算（按钮变为「监测」）；点击「监测」恢复自动预警评估' : 'Fill: check all into shortage; click Monitor to resume auto alerting';
+            fillButton.style.cssText = 'color:#fff;border:none;border-radius:4px;cursor:pointer;background:#1976D2';
+            Object.assign(fillButton.style, MWI_Calculator_UIStyles.cornerAction);
+            summary.appendChild(fillButton);
+            // 物品行与原大类目标行同布局，需求数量自动填入预设值，可修改
+            const applied = { details, checkedItems, rows: [], saveButton, dirty: false, alertRatio, manualFull: false, statusSpan, fillButton };
+            for (const item of items) {
+                const row = this.createPresetItemDisplayElement(item, applied);
+                applied.rows.push({ item, container: row.container, ownedSpan: row.ownedSpan, checkbox: row.checkbox, checked: true });
+                details.appendChild(row.container);
+            }
+            fillButton.addEventListener('click', event => {
+                event.preventDefault();
+                event.stopPropagation();
+                this.toggleAppliedPresetFill(applied);
+            });
+            saveButton.addEventListener('click', event => {
+                event.preventDefault();
+                event.stopPropagation();
+                // 行内修改后的数量覆盖预设并持久化（预警比例沿用原值）
+                const previousPreset = this.presetMap.get(name);
+                this.presetMap.set(name, {
+                    items: applied.rows.map(row => ({ itemHrid: row.item.itemHrid, count: row.item.count })),
+                    alertRatio: this.normalizeAlertRatio(previousPreset?.alertRatio),
+                });
+                this.savePresets();
+                this.refreshPresetOptions();
+                this.saveAppliedPresets();
+                applied.dirty = false;
+                saveButton.style.display = 'none';
+            });
+            host.appendChild(details);
+            this.presetAppliedMap.set(name, applied);
+            // 立即评估一次：填充预警状态显示与自动折叠/展开
+            this.updateAppliedPresetRows();
+            // 预设物品并入缺口计算，无论是否与原清单重合都需要重算
+            this.saveAndScheduleRender();
+            this.saveAppliedPresets();
+        }
+        // 取消已应用的预设：移除同层级类，恢复此前被自动取消勾选的物品
+        static removeAppliedPreset(name) {
+            const applied = this.presetAppliedMap.get(name);
+            if (!applied) return;
+            for (const itemHrid of applied.checkedItems) {
+                const target = this.targetItemsMap.get(itemHrid);
+                if (target && !target.needCalc) {
+                    target.needCalc = true;
+                    target.updateDisplayElement();
+                }
+            }
+            applied.details.remove();
+            this.presetAppliedMap.delete(name);
+            this.saveAndScheduleRender();
+            this.saveAppliedPresets();
+        }
+        // 已应用预设的存储键：与 TargetItems 同前缀、按角色 ID 区分
+        static getAppliedPresetsStorageKey() {
+            const key = this.getStorageKey();
+            return key ? key.replace('TargetItems', 'AppliedPresets') : null;
+        }
+        // 持久化已应用的预设（名称 + 行内当前数量，含未保存回预设的修改）
+        static saveAppliedPresets() {
+            const key = this.getAppliedPresetsStorageKey();
+            if (!key) return false;
+            try {
+                const data = [...this.presetAppliedMap.entries()].map(([appliedName, applied]) => ({
+                    name: appliedName,
+                    items: (applied.rows || []).map(row => ({ itemHrid: row.item.itemHrid, count: row.item.count })),
+                }));
+                GM_setValue(key, JSON.stringify(data));
+                return true;
+            }
+            catch (error) {
+                console.error('[MWI_Calculator] 已应用预设保存失败', error);
+                return false;
+            }
+        }
+        // 刷新/重开页面后恢复上次的预设应用状态（含行内改过的数量）
+        static loadAppliedPresets() {
+            const key = this.getAppliedPresetsStorageKey();
+            if (!key) return false;
+            try {
+                const loaded = JSON.parse(GM_getValue(key, '[]'));
+                if (!Array.isArray(loaded)) return false;
+                for (const entry of loaded) {
+                    if (!entry || typeof entry.name !== 'string' || !entry.name) continue;
+                    if (!Array.isArray(entry.items) || entry.items.length === 0) continue;
+                    if (this.presetAppliedMap.has(entry.name)) continue;
+                    // 预设本体已被删除时不再恢复其应用状态
+                    if (!this.presetMap.has(entry.name)) continue;
+                    const items = [];
+                    for (const item of entry.items) {
+                        if (!item || typeof item.itemHrid !== 'string' || !Number.isFinite(item.count)) continue;
+                        items.push({ itemHrid: item.itemHrid, count: item.count });
+                    }
+                    if (items.length > 0) this.applyPresetItems(entry.name, items);
+                }
+                return true;
+            }
+            catch (error) {
+                console.error('[MWI_Calculator] 已应用预设恢复失败', error);
+                return false;
+            }
+        }
+        // 预设类内物品行：布局与原大类目标行一致（勾选框/拥有/需求），
+        // 需求数量自动填入预设值且可修改；修改后在预设名字框显示保存按钮；无删除按钮。
+        static createPresetItemDisplayElement(presetItem, applied) {
+            const displayItem = {
+                itemHrid: presetItem.itemHrid,
+                count: presetItem.count,
+                iconHref: MWI_Calculator_Utils.getIconHrefByItemHrid(presetItem.itemHrid),
+                displayName: MWI_Calculator_I18n.getItemName(presetItem.itemHrid),
+            };
+            const { container, itemContainer, leftDiv, rightDiv } = this.createBaseItemDisplayItem(displayItem);
+            const needCalcCheckbox = document.createElement('input');
+            needCalcCheckbox.type = 'checkbox';
+            needCalcCheckbox.checked = true;
+            needCalcCheckbox.disabled = true;
+            needCalcCheckbox.title = MWI_Calculator_I18n.isChinese() ? '是否计入缺口：由预警比例自动控制，可用「补满」全部勾选' : 'Counted in shortage: controlled by alert ratio; use Fill to check all';
+            container.prepend(needCalcCheckbox);
+            // 拥有数量
+            const ownedSpan = document.createElement('span');
+            ownedSpan.style.padding = '4px 1px';
+            ownedSpan.style.marginLeft = '4px';
+            ownedSpan.textContent = String(MWI_Calculator_ItemsMap.getCount(presetItem.itemHrid));
+            // 斜杠分隔符
+            const slash = document.createElement('span');
+            slash.textContent = '/';
+            slash.style.padding = '4px 1px';
+            // 需求数量输入框：自动填入预设值，可修改；保存后覆盖预设
+            const targetInput = document.createElement('input');
+            targetInput.type = 'text';
+            targetInput.value = String(presetItem.count);
+            targetInput.placeholder = '需求';
+            targetInput.title = MWI_Calculator_I18n.isChinese() ? '数量由预设填入，可修改，保存后覆盖预设' : 'Preset count, editable; save to overwrite preset';
+            targetInput.style.background = '#dde2f8';
+            targetInput.style.color = '#000000';
+            targetInput.style.border = 'none';
+            targetInput.style.borderRadius = '4px';
+            targetInput.style.padding = '4px';
+            targetInput.style.margin = '2px';
+            Object.assign(targetInput.style, MWI_Calculator_UIStyles.quantityInput);
+            // 仅允许数字
+            targetInput.addEventListener('input', function () {
+                this.value = this.value.replace(/(?!^)-|[^\d-]/g, '');
+            });
+            // 输入框获得焦点时全选内容
+            targetInput.addEventListener('focus', () => {
+                setTimeout(() => { targetInput.select(); }, 0);
+            });
+            // 修改后更新行状态，显示保存按钮，并重算缺口
+            targetInput.addEventListener('change', () => {
+                const value = Math.max(1, parseInt(targetInput.value, 10) || 1);
+                targetInput.value = String(value);
+                presetItem.count = value;
+                applied.dirty = true;
+                if (applied.saveButton) applied.saveButton.style.display = '';
+                const owned = MWI_Calculator_ItemsMap.getCount(presetItem.itemHrid);
+                MWI_Calculator_UI.renderTargetState(container, owned >= value ? 'completed' : 'pending');
+                MWI_Calculator_Calculator.saveAndScheduleRender();
+                MWI_Calculator_Calculator.saveAppliedPresets();
+            });
+            targetInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') targetInput.blur();
+            });
+            rightDiv.appendChild(ownedSpan);
+            rightDiv.appendChild(slash);
+            rightDiv.appendChild(targetInput);
+            leftDiv.remove();
+            // 与目标行相同的自适应布局（无删除按钮，传占位元素占位）
+            MWI_Calculator_UI.attachTargetLayout(container, itemContainer, rightDiv, ownedSpan, targetInput, document.createElement('button'));
+            // 行状态与目标行同规则：达标=completed，未达标=pending
+            const state = MWI_Calculator_ItemsMap.getCount(presetItem.itemHrid) >= presetItem.count ? 'completed' : 'pending';
+            MWI_Calculator_UI.renderTargetState(container, state);
+            return { container, ownedSpan, checkbox: needCalcCheckbox };
+        }
+        // 库存变化触发重渲染时，同步已应用预设行的拥有数量与达标状态，
+        // 并按预警比例评估各行勾选状态（是否计入缺口计算）：
+        //   0 < 预警比例 < 1 时：任一 item 现有/需求 < 预警比例 → 全部勾选（进入预警）；
+        //     否则「现有 < 需求 且 现有/需求 > 预警比例」的 item 取消勾选（暂不计入缺口）。
+        //   预警比例不在 (0,1) 区间时全部勾选（不做预警筛选）。
+        //   「补满」后进入手动状态保持全部勾选；任一 item 跌破预警线后恢复自动评估。
+        static updateAppliedPresetRows() {
+            this.presetAppliedMap?.forEach(applied => {
+                const rows = applied.rows || [];
+                const alertActive = applied.alertRatio > 0;
+                let hasCritical = false;
+                let minRatio = Number.POSITIVE_INFINITY;
+                for (const row of rows) {
+                    const owned = MWI_Calculator_ItemsMap.getCount(row.item.itemHrid);
+                    row.ownedSpan.textContent = String(owned);
+                    if (row.item.count > 0) {
+                        const ratio = owned / row.item.count;
+                        if (ratio < minRatio) minRatio = ratio;
+                        if (alertActive && ratio < applied.alertRatio) hasCritical = true;
+                    }
+                }
+                // 手动补满状态保持全部勾选；出现跌破预警线的物品后恢复自动评估
+                if (applied.manualFull && hasCritical) applied.manualFull = false;
+                const manualFull = applied.manualFull === true;
+                for (const row of rows) {
+                    const owned = MWI_Calculator_ItemsMap.getCount(row.item.itemHrid);
+                    let checked = true;
+                    if (alertActive && !manualFull && !hasCritical) {
+                        checked = !(row.item.count > 0 && owned < row.item.count && owned / row.item.count > applied.alertRatio);
+                    }
+                    row.checked = checked;
+                    if (row.checkbox) row.checkbox.checked = checked;
+                    const state = owned >= row.item.count ? 'completed' : 'pending';
+                    MWI_Calculator_UI.renderTargetState(row.container, state);
+                }
+                // 标题状态：最低 现有/需求 与预警比例比较；绿色自动折叠，红色自动展开
+                // （手动补满状态下不干预展开/折叠，仅刷新比较值）
+                if (applied.statusSpan) {
+                    if (!alertActive) {
+                        applied.statusSpan.style.display = 'none';
+                    }
+                    else {
+                        applied.statusSpan.style.display = '';
+                        const fmtRatio = value => String(Math.round(value * 100) / 100);
+                        if (!Number.isFinite(minRatio)) {
+                            applied.statusSpan.textContent = `--${fmtRatio(applied.alertRatio)}`;
+                            applied.statusSpan.style.color = '#4CAF50';
+                            if (!manualFull && applied.details) applied.details.open = false;
+                        }
+                        else {
+                            const critical = minRatio < applied.alertRatio;
+                            const op = critical ? '<' : (minRatio > applied.alertRatio ? '>' : '=');
+                            applied.statusSpan.textContent = `${fmtRatio(minRatio)}${op}${fmtRatio(applied.alertRatio)}`;
+                            applied.statusSpan.style.color = critical ? '#e0533d' : '#4CAF50';
+                            if (!manualFull && applied.details) applied.details.open = critical;
+                        }
+                    }
+                }
+                // 补满/监测 按钮文案跟随状态
+                if (applied.fillButton) {
+                    applied.fillButton.textContent = manualFull
+                        ? (MWI_Calculator_I18n.isChinese() ? '监测' : 'Monitor')
+                        : (MWI_Calculator_I18n.isChinese() ? '补满' : 'Fill');
+                }
+            });
+        }
+        // 补满/监测 切换：
+        //   补满 → 手动全部勾选（manualFull），不自动折叠，按钮变为「监测」；
+        //   监测 → 取消补满设定，立即按预警比例重新评估勾选与展开/折叠。
+        static toggleAppliedPresetFill(applied) {
+            if (applied.manualFull) {
+                applied.manualFull = false;
+                this.updateAppliedPresetRows();
+                this.saveAndScheduleRender();
+                return;
+            }
+            this.fillAppliedPreset(applied);
+        }
+        // 补满：勾选全部物品（全部计入缺口计算）并重算；
+        // 保持展开（即使比例是绿色也不折叠），直到点击「监测」恢复自动评估
+        static fillAppliedPreset(applied) {
+            applied.manualFull = true;
+            let changed = false;
+            for (const row of applied.rows || []) {
+                if (row.checked !== true) changed = true;
+                row.checked = true;
+                if (row.checkbox) row.checkbox.checked = true;
+            }
+            if (applied.details) applied.details.open = true;
+            if (applied.fillButton) applied.fillButton.textContent = MWI_Calculator_I18n.isChinese() ? '监测' : 'Monitor';
+            if (changed) this.saveAndScheduleRender();
+        }
+        // 预设编辑弹窗：第一条为预设名称输入，第二条为物品搜索框（搜索选中后
+        // 连同数量加入该名称对应的预设，可反复添加）；保存后写入存储并刷新下拉。
+        // initialItems：新建时预填的物品列表（配装页《创建消耗预设》使用）。
+        // initialName：新建时预填的预设名称（配装页默认填入当前配装名）。
+        static showPresetEditorDialog(existingName = null, initialItems = null, initialName = null) {
+            const zh = MWI_Calculator_I18n.isChinese();
+            const sourcePreset = existingName != null ? this.presetMap.get(existingName) : null;
+            let alertRatio = this.normalizeAlertRatio(sourcePreset?.alertRatio);
+            const items = existingName != null
+                ? (sourcePreset?.items || []).map(entry => ({ ...entry }))
+                : (Array.isArray(initialItems)
+                    ? initialItems
+                        .filter(entry => entry && typeof entry.itemHrid === 'string' && Number.isFinite(entry.count) && entry.count > 0)
+                        .map(entry => ({ itemHrid: entry.itemHrid, count: entry.count }))
+                    : []);
+            const overlay = document.createElement('div');
+            overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center';
+            const box = document.createElement('div');
+            box.style.cssText = 'position:relative;width:min(420px,92vw);max-height:88vh;overflow-y:auto;padding:16px;border-radius:12px;'
+                + 'background:linear-gradient(145deg,#152447,#1d3566);color:#eef3ff;border:1px solid #6f9bd8;'
+                + 'box-shadow:0 10px 28px rgba(3,10,26,.55);font:13px/1.6 system-ui,sans-serif';
+            // 第一条：预设名称
+            const nameRow = document.createElement('div');
+            nameRow.style.cssText = 'display:flex;align-items:center;margin-bottom:8px';
+            const nameLabel = document.createElement('span');
+            nameLabel.textContent = zh ? '预设名称' : 'Preset name';
+            nameLabel.style.cssText = 'flex:0 0 auto;margin-right:8px;white-space:nowrap';
+            const nameInput = document.createElement('input');
+            nameInput.type = 'text';
+            nameInput.value = existingName || initialName || '';
+            nameInput.placeholder = zh ? '输入预设名称' : 'Enter preset name';
+            nameInput.style.cssText = 'flex:1;min-width:0;padding:4px;border:none;border-radius:4px;background:#dde2f8;color:#000';
+            nameRow.append(nameLabel, nameInput);
+            // 第二行：暴饮（读取玩家是否持有暴饮之囊，有则显示其最高强化等级，无则显示「无」）
+            const guzzlingRow = document.createElement('div');
+            guzzlingRow.style.cssText = 'display:flex;align-items:center;margin-bottom:8px';
+            const guzzlingLabel = document.createElement('span');
+            guzzlingLabel.textContent = zh ? '暴饮' : 'Guzzling';
+            guzzlingLabel.style.cssText = 'flex:0 0 auto;margin-right:8px;white-space:nowrap';
+            let guzzlingLevel = -1;
+            try { guzzlingLevel = MWI_Calculator_ItemsMap.getMaxEnhancementLevel('/items/guzzling_pouch'); }
+            catch (_) { /* 库存数据未就绪时按未持有处理 */ }
+            const guzzlingValue = document.createElement('span');
+            guzzlingValue.textContent = guzzlingLevel >= 0 ? String(guzzlingLevel) : (zh ? '无' : 'None');
+            guzzlingValue.style.cssText = 'flex:0 0 auto;color:#ffd76e;margin-right:12px';
+            // 天数输入框（紧凑排列）：变更时按规则填入食物/咖啡数量
+            const daysLabel = document.createElement('span');
+            daysLabel.textContent = zh ? '天数' : 'Days';
+            daysLabel.style.cssText = 'flex:0 0 auto;margin-right:8px;white-space:nowrap';
+            const daysInput = document.createElement('input');
+            daysInput.type = 'text';
+            daysInput.value = '1';
+            daysInput.title = zh
+                ? '食物 1440/天；咖啡 288/天（有暴饮之囊时按强化等级加成并向上取整）'
+                : 'Food 1440/day; coffee 288/day (guzzling bonus, rounded up)';
+            daysInput.style.cssText = 'flex:0 0 56px;min-width:0;width:56px;padding:4px;border:none;border-radius:4px;background:#dde2f8;color:#000;text-align:right';
+            // 暴饮强化加成表（+0~+20，百分比）；比例为 0.1×(1+加成)
+            const GUZZLING_BONUS_TABLE = [0, 2.0, 4.2, 6.6, 9.2, 12.0, 15.0, 18.2, 21.6, 25.2, 29.0, 33.4, 38.4, 44.0, 50.2, 57.0, 64.4, 72.4, 81.0, 90.2, 100];
+            // 当前天数（搜索添加物品的规则数量基准）
+            let currentDays = 1;
+            // 数量输入框是否被手动修改过（未修改时食物/咖啡按规则数量添加）
+            let countEdited = false;
+            // 食物/咖啡的规则数量：食物 1440/天；咖啡 ceil(288×(1+暴饮比例))/天；其余返回 null
+            const ruleCountForItem = (itemHrid, days) => {
+                const bonus = guzzlingLevel >= 0 ? (GUZZLING_BONUS_TABLE[Math.min(guzzlingLevel, GUZZLING_BONUS_TABLE.length - 1)] || 0) / 100 : 0;
+                const ratio = guzzlingLevel >= 0 ? 0.1 * (1 + bonus) : 0;
+                const coffeePerDay = Math.ceil(288 * (1 + ratio));
+                let categoryHrid = '';
+                if (itemHrid.endsWith('_coffee')) categoryHrid = '/item_categories/coffee';
+                else if (itemHrid.endsWith('_tea')) categoryHrid = '/item_categories/tea';
+                else categoryHrid = MWI_Calculator.initClientData?.itemDetailMap?.[itemHrid]?.categoryHrid || '';
+                if (categoryHrid === '/item_categories/food') return 1440 * days;
+                if (categoryHrid === '/item_categories/coffee') return coffeePerDay * days;
+                return null;
+            };
+            const applyDaysToItems = (days) => {
+                for (const entry of items) {
+                    const rule = ruleCountForItem(entry.itemHrid, days);
+                    if (rule != null) entry.count = rule;
+                }
+                renderPresetItems();
+            };
+            // 创建消耗预设预填的物品同样按 当前暴饮×天数 规则填充数量
+            if (existingName == null && Array.isArray(initialItems) && initialItems.length > 0) {
+                for (const entry of items) {
+                    const rule = ruleCountForItem(entry.itemHrid, currentDays);
+                    if (rule != null) entry.count = rule;
+                }
+            }
+            daysInput.addEventListener('input', function () {
+                this.value = this.value.replace(/[^\d]/g, '');
+            });
+            daysInput.addEventListener('change', () => {
+                const days = Math.max(1, parseInt(daysInput.value, 10) || 1);
+                daysInput.value = String(days);
+                currentDays = days;
+                countEdited = false;
+                countInput.value = '1';
+                applyDaysToItems(days);
+            });
+            daysInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') daysInput.blur();
+            });
+            // 预警比例（0~1）：随预设保存，显示在该行右侧
+            const ratioSpacer = document.createElement('div');
+            ratioSpacer.style.cssText = 'flex:1';
+            const ratioLabel = document.createElement('span');
+            ratioLabel.textContent = zh ? '预警比例' : 'Alert ratio';
+            ratioLabel.style.cssText = 'flex:0 0 auto;margin-left:12px;margin-right:8px;white-space:nowrap';
+            ratioLabel.title = zh ? '0~1 的小数，随预设一起保存' : 'A decimal between 0 and 1, saved with the preset';
+            const ratioInput = document.createElement('input');
+            ratioInput.type = 'text';
+            ratioInput.value = String(alertRatio);
+            ratioInput.style.cssText = 'flex:0 0 56px;min-width:0;width:56px;padding:4px;border:none;border-radius:4px;background:#dde2f8;color:#000;text-align:right';
+            ratioInput.addEventListener('input', function () {
+                this.value = this.value.replace(/[^\d.]/g, '').replace(/(\..*?)\./g, '$1');
+            });
+            ratioInput.addEventListener('change', () => {
+                alertRatio = MWI_Calculator_Calculator.normalizeAlertRatio(parseFloat(ratioInput.value));
+                ratioInput.value = String(alertRatio);
+            });
+            ratioInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') ratioInput.blur();
+            });
+            guzzlingRow.append(guzzlingLabel, guzzlingValue, daysLabel, daysInput, ratioSpacer, ratioLabel, ratioInput);
+            // 已加入预设的物品列表
+            const itemsList = document.createElement('div');
+            itemsList.style.cssText = 'max-height:200px;overflow-y:auto;margin-bottom:12px;border-radius:4px;background:rgba(0,0,0,.25)';
+            const renderPresetItems = () => {
+                itemsList.innerHTML = '';
+                if (items.length === 0) {
+                    const emptyTip = document.createElement('div');
+                    emptyTip.textContent = zh ? '尚未添加物品' : 'No items added';
+                    emptyTip.style.cssText = 'padding:6px 4px;opacity:.6';
+                    itemsList.appendChild(emptyTip);
+                    return;
+                }
+                items.forEach((entry, index) => {
+                    const row = document.createElement('div');
+                    row.style.cssText = 'display:flex;align-items:center;padding:4px;border-bottom:1px solid #98a7e9';
+                    const itemIcon = document.createElement('div');
+                    const iconHref = MWI_Calculator_Utils.getIconHrefByItemHrid(entry.itemHrid);
+                    itemIcon.appendChild(MWI_Calculator_Utils.createIconSvg(iconHref));
+                    const itemName = document.createElement('span');
+                    itemName.textContent = MWI_Calculator_I18n.getItemName(entry.itemHrid);
+                    itemName.style.cssText = 'flex:1;min-width:0;margin-left:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+                    const countEdit = document.createElement('input');
+                    countEdit.type = 'text';
+                    countEdit.value = String(entry.count);
+                    countEdit.title = zh ? '数量（可直接修改）' : 'Count (editable)';
+                    countEdit.style.cssText = 'flex:0 0 48px;margin-right:6px;padding:2px 4px;border:none;border-radius:4px;background:#dde2f8;color:#000;text-align:right';
+                    countEdit.addEventListener('input', () => {
+                        countEdit.value = countEdit.value.replace(/[^\d]/g, '');
+                    });
+                    countEdit.addEventListener('change', () => {
+                        entry.count = Math.max(1, parseInt(countEdit.value, 10) || 1);
+                        countEdit.value = String(entry.count);
+                    });
+                    countEdit.addEventListener('keydown', (e) => {
+                        if (e.key === 'Enter') countEdit.blur();
+                    });
+                    const removeButton = document.createElement('button');
+                    removeButton.type = 'button';
+                    removeButton.textContent = zh ? '删除' : 'Remove';
+                    removeButton.style.cssText = 'flex:0 0 auto;color:#fff;border:none;border-radius:4px;padding:2px 6px;cursor:pointer;background:#c05621';
+                    removeButton.addEventListener('click', () => {
+                        items.splice(index, 1);
+                        renderPresetItems();
+                    });
+                    row.append(itemIcon, itemName, countEdit, removeButton);
+                    itemsList.appendChild(row);
+                });
+            };
+            // 第二条：物品搜索框 + 数量 + 添加
+            const searchRow = document.createElement('div');
+            searchRow.style.cssText = 'display:flex;align-items:stretch;position:relative;margin-bottom:8px';
+            const searchInput = document.createElement('input');
+            searchInput.type = 'text';
+            searchInput.placeholder = zh ? '搜索物品名称...' : 'Search item name...';
+            searchInput.style.cssText = 'flex:1;min-width:0;padding:4px;margin-right:6px;border:none;border-radius:4px;background:#dde2f8;color:#000';
+            const countInput = document.createElement('input');
+            countInput.type = 'text';
+            countInput.value = '1';
+            countInput.placeholder = zh ? '数量' : 'Count';
+            countInput.style.cssText = 'flex:0 0 52px;padding:4px;margin-right:6px;border:none;border-radius:4px;background:#dde2f8;color:#000';
+            countInput.addEventListener('input', function () {
+                this.value = this.value.replace(/[^\d]/g, '');
+                countEdited = true;
+            });
+            const addEntryButton = document.createElement('button');
+            addEntryButton.type = 'button';
+            addEntryButton.textContent = zh ? '添加' : 'Add';
+            addEntryButton.style.cssText = 'flex:0 0 auto;color:#fff;border:none;border-radius:4px;padding:4px 10px;cursor:pointer;background:#4CAF50';
+            const searchResults = document.createElement('div');
+            searchResults.style.cssText = 'position:absolute;left:0;top:32px;width:220px;max-height:260px;overflow-y:auto;'
+                + 'z-index:1000;display:none;padding:4px;border-radius:4px;background:' + MWI_Calculator_UITheme.surface;
+            this.registerCalculatorDropdown(searchRow, searchResults);
+            const close = () => {
+                this.calculatorDropdowns?.delete(searchResults);
+                overlay.remove();
+            };
+            const addEntry = () => {
+                const itemHrid = MWI_Calculator_I18n.getItemHridByName(searchInput.value.trim());
+                if (!itemHrid) return;
+                let count = Math.max(1, parseInt(countInput.value, 10) || 1);
+                // 数量未被手动修改时，食物/咖啡按 当前暴饮×天数 的规则数量添加
+                if (!countEdited) {
+                    const rule = ruleCountForItem(itemHrid, currentDays);
+                    if (rule != null) count = rule;
+                }
+                const existing = items.find(entry => entry.itemHrid === itemHrid);
+                if (existing) existing.count += count;
+                else items.push({ itemHrid, count });
+                searchInput.value = '';
+                countInput.value = '1';
+                countEdited = false;
+                searchResults.style.display = 'none';
+                renderPresetItems();
+            };
+            searchInput.addEventListener('input', () => {
+                // 多关键词 AND 搜索，与主搜索框同逻辑
+                const searchTerms = searchInput.value.toLowerCase().trim().split(/\s+/).filter(Boolean);
+                if (searchTerms.length < 1) { searchResults.style.display = 'none'; return; }
+                const itemDetailMap = MWI_Calculator?.initClientData?.itemDetailMap;
+                if (!itemDetailMap) return;
+                const filteredItems = Object.keys(itemDetailMap)
+                    .filter(itemHrid => {
+                        const name = MWI_Calculator_I18n.getItemName(itemHrid).toLowerCase();
+                        return searchTerms.every(term => name.includes(term));
+                    })
+                    .sort((a, b) => MWI_Calculator_Utils.getSortIndexByItemHrid(a) - MWI_Calculator_Utils.getSortIndexByItemHrid(b));
+                if (filteredItems.length === 0) { searchResults.style.display = 'none'; return; }
+                this.populateSearchResults(searchResults, filteredItems, (itemHrid) => {
+                    searchInput.value = MWI_Calculator_I18n.getItemName(itemHrid);
+                    // 选中物品后，数量默认按 当前暴饮×天数 规则填入（食物/咖啡）
+                    const rule = ruleCountForItem(itemHrid, currentDays);
+                    countInput.value = String(rule != null ? rule : 1);
+                    countEdited = false;
+                    searchResults.style.display = 'none';
+                });
+                this.openCalculatorDropdown(searchResults);
+            });
+            searchInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') { e.preventDefault(); addEntry(); }
+            });
+            countInput.addEventListener('input', () => {
+                countInput.value = countInput.value.replace(/(?!^)-|[^\d-]/g, '');
+            });
+            countInput.addEventListener('keydown', (e) => {
+                if (e.key === 'Enter') { e.preventDefault(); addEntry(); }
+            });
+            addEntryButton.addEventListener('click', addEntry);
+            searchRow.append(searchInput, countInput, addEntryButton, searchResults);
+            renderPresetItems();
+            // 底部按钮：导入 / 导出（最左）…… 保存 / 取消（右）
+            const buttonRow = document.createElement('div');
+            buttonRow.style.cssText = 'display:flex;gap:8px;align-items:center';
+            // 剪贴板写入：GM_setClipboard → navigator.clipboard → execCommand 兜底
+            const copyTextToClipboard = async (text) => {
+                try {
+                    if (typeof GM_setClipboard === 'function') { GM_setClipboard(text, 'text'); return true; }
+                }
+                catch (_) { /* 退化到浏览器剪贴板 */ }
+                try {
+                    if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(text); return true; }
+                }
+                catch (_) { /* 退化到 execCommand */ }
+                try {
+                    const textarea = document.createElement('textarea');
+                    textarea.value = text;
+                    textarea.style.cssText = 'position:fixed;top:0;left:0;opacity:0';
+                    document.body.appendChild(textarea);
+                    textarea.select();
+                    const ok = document.execCommand('copy');
+                    textarea.remove();
+                    return ok;
+                }
+                catch (_) { return false; }
+            };
+            // 解析并导入 BUILTIN_PRESETS 条目格式（也兼容条目数组，取第一个有效项）
+            const importPresetPayload = (text) => {
+                let data;
+                try { data = JSON.parse(text); }
+                catch (_) { alert(zh ? '导入内容不是有效的 JSON' : 'Invalid JSON'); return; }
+                const entry = Array.isArray(data) ? data.find(item => item && typeof item === 'object') : data;
+                if (!entry || typeof entry !== 'object' || typeof entry.name !== 'string' || !entry.name.trim() || !Array.isArray(entry.items)) {
+                    alert(zh ? '导入格式无效：需要 { name, items: [{ itemHrid, count }] }' : 'Expected { name, items: [{ itemHrid, count }] }');
+                    return;
+                }
+                const validItems = [];
+                for (const item of entry.items) {
+                    if (!item || typeof item.itemHrid !== 'string' || !Number.isFinite(item.count) || item.count <= 0) continue;
+                    validItems.push({ itemHrid: item.itemHrid, count: item.count });
+                }
+                if (validItems.length === 0) {
+                    alert(zh ? '导入内容中没有有效物品' : 'No valid items in imported content');
+                    return;
+                }
+                // 导入覆盖当前编辑中的名称与物品列表
+                items.length = 0;
+                items.push(...validItems);
+                nameInput.value = entry.name.trim();
+                alertRatio = MWI_Calculator_Calculator.normalizeAlertRatio(entry.alertRatio);
+                ratioInput.value = String(alertRatio);
+                renderPresetItems();
+            };
+            const importButton = document.createElement('button');
+            importButton.type = 'button';
+            importButton.textContent = zh ? '导入' : 'Import';
+            importButton.title = zh ? '从剪贴板导入预设（格式同 BUILTIN_PRESETS 条目，覆盖当前编辑内容）' : 'Import preset from clipboard (BUILTIN_PRESETS entry format)';
+            importButton.style.cssText = 'color:#fff;border:none;border-radius:7px;padding:6px 14px;cursor:pointer;background:#1976D2';
+            importButton.addEventListener('click', async () => {
+                let text = '';
+                try {
+                    if (navigator.clipboard?.readText) text = await navigator.clipboard.readText();
+                }
+                catch (_) { text = ''; }
+                if (text && text.trim()) { importPresetPayload(text); return; }
+                // 剪贴板不可读（无权限/不支持）时退化为手动粘贴
+                const pasteOverlay = document.createElement('div');
+                pasteOverlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center';
+                const pasteBox = document.createElement('div');
+                pasteBox.style.cssText = 'width:min(460px,92vw);padding:16px;border-radius:12px;background:linear-gradient(145deg,#152447,#1d3566);color:#eef3ff;border:1px solid #6f9bd8;font:13px/1.6 system-ui,sans-serif';
+                const pasteTip = document.createElement('div');
+                pasteTip.textContent = zh ? '无法直接读取剪贴板，请手动粘贴预设 JSON 后点击确定：' : 'Cannot read clipboard; paste the preset JSON below:';
+                pasteTip.style.cssText = 'margin-bottom:8px';
+                const pasteTextarea = document.createElement('textarea');
+                pasteTextarea.style.cssText = 'width:100%;height:120px;box-sizing:border-box;padding:6px;border:none;border-radius:4px;background:#dde2f8;color:#000;resize:vertical;font:12px/1.5 monospace';
+                const pasteRow = document.createElement('div');
+                pasteRow.style.cssText = 'display:flex;gap:8px;justify-content:flex-end;margin-top:8px';
+                const pasteOk = document.createElement('button');
+                pasteOk.type = 'button';
+                pasteOk.textContent = zh ? '确定' : 'OK';
+                pasteOk.style.cssText = 'color:#fff;border:none;border-radius:7px;padding:6px 14px;cursor:pointer;background:#2e7d32';
+                pasteOk.addEventListener('click', () => {
+                    const value = pasteTextarea.value.trim();
+                    pasteOverlay.remove();
+                    if (value) importPresetPayload(value);
+                });
+                const pasteCancel = document.createElement('button');
+                pasteCancel.type = 'button';
+                pasteCancel.textContent = zh ? '取消' : 'Cancel';
+                pasteCancel.style.cssText = 'color:#fff;border:none;border-radius:7px;padding:6px 14px;cursor:pointer;background:#344879';
+                pasteCancel.addEventListener('click', () => pasteOverlay.remove());
+                pasteRow.append(pasteOk, pasteCancel);
+                pasteBox.append(pasteTip, pasteTextarea, pasteRow);
+                pasteOverlay.appendChild(pasteBox);
+                document.body.appendChild(pasteOverlay);
+                pasteTextarea.focus();
+            });
+            const exportButton = document.createElement('button');
+            exportButton.type = 'button';
+            exportButton.textContent = zh ? '导出' : 'Export';
+            exportButton.title = zh ? '将当前预设（名称+物品+数量）按 BUILTIN_PRESETS 条目格式复制到剪贴板' : 'Copy current preset as BUILTIN_PRESETS entry';
+            exportButton.style.cssText = 'color:#fff;border:none;border-radius:7px;padding:6px 14px;cursor:pointer;background:#1976D2';
+            exportButton.addEventListener('click', async () => {
+                const payload = JSON.stringify({
+                    name: nameInput.value.trim(),
+                    items: items.map(entry => ({ itemHrid: entry.itemHrid, count: entry.count })),
+                    alertRatio,
+                });
+                const ok = await copyTextToClipboard(payload);
+                if (ok) alert(zh ? '已将当前预设导出到剪贴板' : 'Preset copied to clipboard');
+                else {
+                    console.log('[MWI_Calculator] 预设导出 JSON:', payload);
+                    alert(zh ? '复制失败，JSON 已输出到控制台，请手动复制' : 'Copy failed; JSON printed to console');
+                }
+            });
+            const saveButton = document.createElement('button');
+            saveButton.type = 'button';
+            saveButton.textContent = zh ? '保存' : 'Save';
+            saveButton.style.cssText = 'color:#fff;border:none;border-radius:7px;padding:6px 14px;cursor:pointer;background:#2e7d32';
+            saveButton.addEventListener('click', () => {
+                const presetName = nameInput.value.trim();
+                if (!presetName) {
+                    alert(zh ? '请先输入预设名称' : 'Please enter a preset name first');
+                    nameInput.focus();
+                    return;
+                }
+                if (items.length === 0) {
+                    alert(zh ? '请至少添加一个物品' : 'Please add at least one item');
+                    return;
+                }
+                if (this.presetMap.has(presetName) && presetName !== existingName
+                    && !confirm(zh ? `预设「${presetName}」已存在，是否覆盖？` : `Preset "${presetName}" already exists. Overwrite?`)) {
+                    return;
+                }
+                this.presetMap.set(presetName, { items, alertRatio });
+                // 从已有预设改名保存时视为重命名，移除旧名称条目；
+                // 若旧名已应用则同步转移应用记录并更新类标题
+                if (existingName != null && existingName !== presetName) {
+                    this.presetMap.delete(existingName);
+                    const applied = this.presetAppliedMap.get(existingName);
+                    if (applied) {
+                        this.presetAppliedMap.delete(existingName);
+                        this.presetAppliedMap.set(presetName, applied);
+                        const appliedSummary = applied.details.querySelector('summary');
+                        if (appliedSummary) appliedSummary.textContent = presetName;
+                    }
+                }
+                // 覆盖同名旧预设时，若旧预设已应用则先移除其应用状态
+                if (presetName !== existingName && this.presetAppliedMap.has(presetName)) {
+                    this.removeAppliedPreset(presetName);
+                }
+                this.savePresets();
+                this.refreshPresetOptions();
+                close();
+            });
+            const cancelButton = document.createElement('button');
+            cancelButton.type = 'button';
+            cancelButton.textContent = zh ? '取消' : 'Cancel';
+            cancelButton.style.cssText = 'color:#fff;border:none;border-radius:7px;padding:6px 14px;cursor:pointer;background:#344879';
+            cancelButton.addEventListener('click', close);
+            const buttonSpacer = document.createElement('div');
+            buttonSpacer.style.cssText = 'flex:1';
+            buttonRow.append(importButton, exportButton, buttonSpacer, saveButton, cancelButton);
+            box.append(nameRow, guzzlingRow, searchRow, itemsList, buttonRow);
+            overlay.appendChild(box);
+            document.body.appendChild(overlay);
+            nameInput.focus();
         }
         // 创建大类添加框：选择物品大类后一次性加入该类全部物品
         // 与物品添加栏使用相同的自然行高、4px 内边距和 2px 外边距。
@@ -2209,6 +3282,8 @@
                 });
                 if (details.hidden !== (itemCount === 0)) details.hidden = itemCount === 0;
             });
+            // 先同步拥有数量并评估预警勾选，缺口计算才能使用最新参与状态
+            this.updateAppliedPresetRows();
             const inventoryMap = MWI_Calculator_ItemsMap.getInventoryMap();
             const totalNeeds = MWI_Calculator_Calculator.calculateAllRequiredItems(new Map());
             const downgradeItems = new Map();
@@ -2771,6 +3846,60 @@
     MWI_Calculator_Calculator.targetItemCategoryMap = new Map();
     MWI_Calculator_Calculator.targetItemsMap = new Map();
     MWI_Calculator_Calculator.requiredItemsMap = new Map();
+    MWI_Calculator_Calculator.presetMap = new Map();
+    MWI_Calculator_Calculator.presetOptionsContainer = null;
+    MWI_Calculator_Calculator.presetManageMode = false;
+    MWI_Calculator_Calculator.presetAppliedMap = new Map();
+    MWI_Calculator_Calculator.presetDetailsHost = null;
+    // ── 内置预设模板（按需增删）────────────────────────────────
+    // 格式：{ name: 预设名, items: [{ itemHrid: '/items/xxx', count: 数量 }],
+    //        alertRatio: 预警比例（0~1 小数，可选，缺省按 0 处理） }
+    // 仅当该角色「从未保存过预设」时自动写入；写入后与普通预设无异，
+    // 可改名/修改/删除，清空后也不会被刷新还原。
+
+    MWI_Calculator_Calculator.BUILTIN_PRESETS = [
+        {
+            name: '生活咖啡',
+            alertRatio: 1,
+            items: [
+                { itemHrid: '/items/gathering_tea', count: 1000 },
+                { itemHrid: '/items/processing_tea', count: 1000 },
+                { itemHrid: '/items/efficiency_tea', count: 1000 },
+                { itemHrid: '/items/foraging_tea', count: 1000 },
+                { itemHrid: '/items/artisan_tea', count: 1000 },
+                { itemHrid: '/items/wisdom_tea', count: 1000 },
+                { itemHrid: '/items/gourmet_tea', count: 1000 },
+                { itemHrid: '/items/alchemy_tea', count: 300 },
+                { itemHrid: '/items/catalytic_tea', count: 300 },
+                { itemHrid: '/items/enhancing_tea', count: 300 },
+                { itemHrid: '/items/blessed_tea', count: 300 },
+            ],
+        },
+        {
+            name: 'D1坦克吃喝',
+            alertRatio: 1,
+            items: [
+                { itemHrid: '/items/super_defense_coffee', count: 1 },
+                { itemHrid: '/items/super_stamina_coffee', count: 1 },
+                { itemHrid: '/items/super_intelligence_coffee', count: 1 },
+                { itemHrid: '/items/spaceberry_donut', count: 1 },
+                { itemHrid: '/items/spaceberry_cake', count: 1 },
+                { itemHrid: '/items/star_fruit_yogurt', count: 1 },
+            ],
+        },
+        {
+            name: 'D1搬空',
+            alertRatio: 1,
+            items: [
+                { itemHrid: '/items/jackalope_staff', count: 1 },
+                { itemHrid: '/items/griffin_bulwark', count: 1 },
+                { itemHrid: '/items/manticore_shield', count: 1 },
+                { itemHrid: '/items/dodocamel_gauntlets', count: 1 },
+                { itemHrid: '/items/griffin_tunic', count: 1 },
+                { itemHrid: '/items/griffin_chaps', count: 1 },
+            ],
+        },
+    ];
     MWI_Calculator_Calculator.houseAcquisitionMode = 'craft';
     MWI_Calculator_Calculator.materialPlanningMode = 'redundant';
     MWI_Calculator_Calculator.tabButton = null;
@@ -3845,6 +4974,113 @@
     MWI_Calculator.initClientData = null;
     MWI_Calculator.characterGameMode = '';
     MWI_Calculator.initialized = false;
+    //#region 配装页《创建消耗预设》按钮
+    // 仅战斗配装注入按钮，
+    // 点击读取当前配装的 foodItemHrids / drinkItemHrids，以数量 1 预填预设新建弹窗。
+    const LOADOUT_PRESET_SELECTORS = {
+        selectedLoadout: '[class*="LoadoutsPanel_selectedLoadout__"]',
+        loadoutDetails: '[class*="LoadoutsPanel_details__"], [class*="details"]',
+        buttonsContainer: '[class*="buttonsContainer"]'
+    };
+    // 从 React 组件 props 挖取 memoizedProps（游戏把配装状态挂在组件 props 上）
+    function getLoadoutReactData(el) {
+        try {
+            const key = Reflect.ownKeys(el || {}).find(k => String(k).startsWith('__reactProps'));
+            const props = key ? el[key] : null;
+            return props?.children?.[0]?._owner?.memoizedProps || props?._owner?.memoizedProps || props || {};
+        }
+        catch (_) { return {}; }
+    }
+    // 读取配装标题（metadata 中 svg 图标与更新按钮之间的文本节点）
+    function getLoadoutName(detailsEl) {
+        const titleEl = detailsEl?.querySelector('[class*="LoadoutsPanel_metadata__"], [class*="metadata"]');
+        const svgEl = titleEl?.querySelector('svg');
+        const updateBtn = titleEl?.querySelector('button');
+        let text = '';
+        let current = svgEl?.nextSibling;
+        while (current && current !== updateBtn) {
+            if (current.nodeType === Node.TEXT_NODE) text += current.textContent || '';
+            current = current.nextSibling;
+        }
+        return text.trim();
+    }
+    function createConsumablePresetFromLoadout() {
+        if (!MWI_Calculator.initialized) {
+            alert('请等待游戏加载完成后再创建消耗预设。');
+            return;
+        }
+        const panel = document.querySelector(LOADOUT_PRESET_SELECTORS.selectedLoadout);
+        const detailsEl = panel ? panel.querySelector(LOADOUT_PRESET_SELECTORS.loadoutDetails) : null;
+        const reactData = getLoadoutReactData(detailsEl);
+        const name = getLoadoutName(detailsEl);
+        const collectionValues = collection => Array.isArray(collection) ? collection
+            : collection instanceof Map ? [...collection.values()]
+            : (collection && typeof collection === 'object' ? Object.values(collection) : []);
+        const reactLoadouts = collectionValues(reactData?.characterLoadoutDict);
+        const rawLoadouts = collectionValues(MWI_Calculator.gameObject?.state?.characterLoadoutMap);
+        const loadouts = reactLoadouts.length ? reactLoadouts : rawLoadouts;
+        const loadout = loadouts.find(item => item?.name === name);
+        if (!loadout) {
+            alert('未找到当前配装，请确认已打开战斗配装页。');
+            return;
+        }
+        // 仅取食物与饮料，数量一律为 1
+        const hrids = new Set();
+        for (const itemHrid of [...(loadout.foodItemHrids || []), ...(loadout.drinkItemHrids || [])]) {
+            if (typeof itemHrid === 'string' && itemHrid.startsWith('/items/')) hrids.add(itemHrid);
+        }
+        if (hrids.size === 0) {
+            alert('当前配装没有可用的食物或饮料。');
+            return;
+        }
+        const items = [...hrids].map(itemHrid => ({ itemHrid, count: 1 }));
+        // 预设名称默认取当前配装名 + 「配装消耗」后缀
+        const presetName = name ? (MWI_Calculator_I18n.isChinese() ? `${name}配装消耗` : `${name} loadout`) : null;
+        MWI_Calculator_Calculator.showPresetEditorDialog(null, items, presetName);
+    }
+    // 战斗配装页注入按钮；非战斗配装或离开页面时移除
+    let loadoutPresetSyncFrame = null;
+    function syncLoadoutPresetButton() {
+        const panel = document.querySelector(LOADOUT_PRESET_SELECTORS.selectedLoadout);
+        const detailsEl = panel ? panel.querySelector(LOADOUT_PRESET_SELECTORS.loadoutDetails) : null;
+        const combatIcon = detailsEl?.querySelector('[class*="metadata"] svg use')?.getAttribute('href')?.split('#').pop();
+        let row = document.querySelector('.mwi-calculator-preset-row');
+        if (!panel || combatIcon !== 'combat') {
+            if (row) row.remove();
+            return;
+        }
+        if (panel.querySelector('.mwi-calculator-preset-btn')) return;
+        const container = panel.querySelector(LOADOUT_PRESET_SELECTORS.buttonsContainer) || panel;
+        const reference = container.querySelector('button:last-child');
+        const button = reference ? reference.cloneNode(true) : document.createElement('button');
+        if (!reference) {
+            button.style.cssText = 'margin:4px;padding:4px 8px;border:none;border-radius:4px;background:#1976D2;color:#fff;cursor:pointer';
+        }
+        button.type = 'button';
+        button.classList.add('mwi-calculator-preset-btn');
+        button.textContent = MWI_Calculator_I18n.isChinese() ? '创建消耗预设' : 'Create consumable preset';
+        button.addEventListener('click', createConsumablePresetFromLoadout);
+        row = document.createElement('div');
+        row.className = 'mwi-calculator-preset-row';
+        container.insertAdjacentElement('afterend', row);
+        row.appendChild(button);
+    }
+    const loadoutPresetObserver = new MutationObserver(() => {
+        if (loadoutPresetSyncFrame) return;
+        loadoutPresetSyncFrame = requestAnimationFrame(() => {
+            loadoutPresetSyncFrame = null;
+            try { syncLoadoutPresetButton(); }
+            catch (error) { console.error('[MWI_Calculator] 配装预设按钮同步失败', error); }
+        });
+    });
+    {
+        const root = document.body || document.documentElement;
+        if (root) {
+            loadoutPresetObserver.observe(root, { childList: true, subtree: true });
+            try { syncLoadoutPresetButton(); }
+            catch (_) { /* 初始化时配装页未打开属正常 */ }
+        }
+    }
     //#endregion
     // 防止重复加载
     if (unsafeWindow.MWI_Calculator_Started) {
