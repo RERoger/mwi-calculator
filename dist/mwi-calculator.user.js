@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         [银河奶牛]生产制作计算器
-// @version      0.1.6
+// @version      0.1.7
 // @namespace    http://tampermonkey.net/
 // @description  银河奶牛计算器，自动计算需求缺口，一键跳转到制作、购买。Calculator for MilkyWayIdle，Automatically calculate supply-demand gaps and navigate to production or purchasing with a single click.
 // @author       RERoger
@@ -2727,8 +2727,12 @@
                 const quantity = target ? target.quantity : Number(shortage?.shortageCount) || 0;
                 if (!quantity || (!target && !shortage)) continue;
                 if (modal.dataset.mwiCalculatorPrefilled === modalItemHrid) continue;
-                const input = [...modal.querySelectorAll('[class*="MarketplacePanel_quantityInputs"] input, input[type="number"]')].find(visible);
-                if (!input) continue;
+                // 仅接受数量专属区域；数字框可能是强化等级或价格，禁止按位置兜底。
+                const quantityInputs = [...modal.querySelectorAll('[class*="MarketplacePanel_quantityInputs"] input')]
+                    .filter(input => visible(input) && !input.disabled && !input.readOnly
+                        && ['text', 'number', 'tel'].includes(input.type));
+                if (quantityInputs.length !== 1) continue;
+                const input = quantityInputs[0];
                 const value = String(quantity);
                 try {
                     const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
