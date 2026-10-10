@@ -628,16 +628,54 @@
             void this.chooseImportMode(sourceID);
             return true;
         }
+        static createImportDialogBox() {
+            const box = document.createElement('div');
+            box.style.cssText = 'position:relative;width:min(380px,90vw);padding:16px;border-radius:12px;'
+                + 'background:linear-gradient(145deg,#152447,#1d3566);color:#eef3ff;border:1px solid #6f9bd8;'
+                + 'box-shadow:0 10px 28px rgba(3,10,26,.55);font:13px/1.6 system-ui,sans-serif';
+            return box;
+        }
+        // 导入结果非阻塞提示：复用选择框外观，重复提示替换旧提示。
+        static showImportResult(message) {
+            clearTimeout(this.importResultTimer);
+            this.dismissImportResult?.();
+            const box = this.createImportDialogBox();
+            box.id = 'mwi-calculator-import-result';
+            box.setAttribute('role', 'status');
+            box.setAttribute('aria-live', 'polite');
+            Object.assign(box.style, {
+                position: 'fixed', top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
+                zIndex: '2147483647', boxSizing: 'border-box',
+            });
+            const text = document.createElement('div');
+            text.textContent = message;
+            const outsideClick = event => {
+                if (!box.contains(event.target)) dismiss();
+            };
+            const dismiss = () => {
+                document.removeEventListener('click', outsideClick, true);
+                box.remove();
+                if (this.importResultNotice === box) {
+                    clearTimeout(this.importResultTimer);
+                    this.importResultTimer = null;
+                    this.importResultNotice = null;
+                    this.dismissImportResult = null;
+                }
+            };
+            box.append(text);
+            document.addEventListener('click', outsideClick, true);
+            this.dismissImportResult = dismiss;
+            document.body.appendChild(box);
+            this.importResultNotice = box;
+            this.importResultTimer = setTimeout(dismiss, 3000);
+        }
         // 导入方式选择弹窗，resolve('merge' | 'overwrite' | null)
         static showImportModeDialog(sourceID) {
             return new Promise(resolve => {
                 const finish = value => { overlay.remove(); resolve(value); };
                 const overlay = document.createElement('div');
                 overlay.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center';
-                const box = document.createElement('div');
-                box.style.cssText = 'position:relative;width:min(380px,90vw);padding:16px;border-radius:12px;'
-                    + 'background:linear-gradient(145deg,#152447,#1d3566);color:#eef3ff;border:1px solid #6f9bd8;'
-                    + 'box-shadow:0 10px 28px rgba(3,10,26,.55);font:13px/1.6 system-ui,sans-serif';
+                const box = this.createImportDialogBox();
                 const text = document.createElement('div');
                 text.style.cssText = 'margin-bottom:12px';
                 text.textContent = `将角色 ${sourceID} 的清单导入到当前角色 ${this.activeCharacterID}：`;
@@ -769,8 +807,8 @@
                 const result = mode === 'overwrite'
                     ? this.runImportTransaction(() => this.loadCalculatorData(sourceID, { importToCurrent: true }))
                     : this.mergeItemsFromCharacter(sourceID);
-                if (!result) { alert('导入失败，未完成保存；请检查控制台，确认原清单后重试。'); return false; }
-                alert(mode === 'overwrite' ? `已用角色 ${sourceID} 的清单覆盖当前清单`
+                if (!result) { this.showImportResult('导入失败，未完成保存；请检查控制台，确认原清单后重试。'); return false; }
+                this.showImportResult(mode === 'overwrite' ? `已用角色 ${sourceID} 的清单覆盖当前清单`
                     : `合并导入完成：新增 ${result.added} 项，已存在 ${result.kept} 项保持不变`);
                 return true;
             }
