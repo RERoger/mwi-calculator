@@ -624,7 +624,7 @@
             const sourceID = this.normalizeCharacterID(characterID);
             if (sourceID == null) return false;
             if (sourceID === this.activeCharacterID) return this.loadCalculatorData();
-            // 三选一弹窗：合并导入 / 覆盖替换 / 取消（原为 confirm 二选一）
+            // 导入其他角色时直接覆盖；仍保留备份、事务回滚和角色校验。
             void this.chooseImportMode(sourceID);
             return true;
         }
@@ -798,18 +798,13 @@
             const generation = this.characterGeneration;
             this.importDialogPending = true;
             try {
-                const mode = await this.showImportModeDialog(sourceID);
-                if (mode !== 'merge' && mode !== 'overwrite') return false;
-                // 包括 A -> B -> A：旧弹窗同样失效，绝不导入到新会话。
+                // 导入期间若角色会话已变化，停止写入。
                 if (!this.canUseCharacterData() || this.activeCharacterID !== destinationID
                     || this.characterGeneration !== generation) return false;
                 if (!this.backupCurrentListBeforeImport()) return false;
-                const result = mode === 'overwrite'
-                    ? this.runImportTransaction(() => this.loadCalculatorData(sourceID, { importToCurrent: true }))
-                    : this.mergeItemsFromCharacter(sourceID);
+                const result = this.runImportTransaction(() => this.loadCalculatorData(sourceID, { importToCurrent: true }));
                 if (!result) { this.showImportResult('导入失败，未完成保存；请检查控制台，确认原清单后重试。'); return false; }
-                this.showImportResult(mode === 'overwrite' ? `已用角色 ${sourceID} 的清单覆盖当前清单`
-                    : `合并导入完成：新增 ${result.added} 项，已存在 ${result.kept} 项保持不变`);
+                this.showImportResult(`已用角色 ${sourceID} 的清单覆盖当前清单`);
                 return true;
             }
             catch (error) { console.error('[MWI_Calculator] 导入失败', error); return false; }
