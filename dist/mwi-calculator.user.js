@@ -1008,7 +1008,9 @@
                 const remain = needs.target + needs.material + needs.upgrade;
                 if (!(remain > 0)) continue;
                 result.set(itemHrid, (result.get(itemHrid) || 0) + remain);
-                if (this.houseAcquisitionMode === 'buy' && this.showIntermediateProducts === false) continue;
+                // 仅成品只在可交易物品处停止；不可交易产品继续展开可购买材料。
+                if (this.houseAcquisitionMode === 'buy' && this.showIntermediateProducts === false
+                    && MWI_Calculator.initClientData?.itemDetailMap?.[itemHrid]?.isTradable === true) continue;
                 const recipe = MWI_Calculator_ActionDetailPlus.tryGetRecipe(itemHrid);
                 if (!recipe) continue;
                 const redundant = (this.houseAcquisitionMode !== 'buy' || this.showIntermediateProducts !== false) && this.materialPlanningMode === 'redundant';
@@ -2285,7 +2287,10 @@
             const previous = MWI_Calculator_ActionDetailPlus.renderRecipeCache;
             MWI_Calculator_ActionDetailPlus.renderRecipeCache = new Map();
             this.renderingVisible = true;
-            try { this.renderVisibleItems(); this.renderDirty = false; }
+            try {
+                MWI_Calculator_ItemsMap.syncFromGame();
+                this.renderVisibleItems(); this.renderDirty = false;
+            }
             finally {
                 this.renderingVisible = false;
                 MWI_Calculator_ActionDetailPlus.renderRecipeCache = previous;
@@ -3682,6 +3687,26 @@
     //#endregion
     //#region ItemsMap
     class MWI_Calculator_ItemsMap {
+        // 更新/延迟注入可能错过初始化包；按当前角色的完整快照补齐静置装备。
+        // 在渲染前同步，不触发更新回调，避免递归调度；全量替换也清除已消耗库存。
+        static syncFromGame() {
+            const calculator = MWI_Calculator_Calculator;
+            const game = MWI_Calculator.getGameObject();
+            const id = calculator.normalizeCharacterID(game?.state?.character?.id);
+            const snapshot = game?.state?.characterItemMap;
+            if (id == null || id !== calculator.activeCharacterID
+                || id !== calculator.getSessionCharacterID()
+                || !calculator.canUseCharacterData()
+                || typeof snapshot?.values !== 'function') return false;
+            const items = [...snapshot.values()];
+            if (items.some(item => !item || typeof item.itemHrid !== 'string'
+                || !Number.isInteger(item.enhancementLevel) || item.enhancementLevel < 0
+                || !Number.isFinite(item.count))) return false;
+            MWI_Calculator.gameObject = game;
+            this.clear();
+            this.update(items, false);
+            return true;
+        }
         // 获取物品数量
         static getCount(itemHrid, enhancementLevel = 0) {
             return MWI_Calculator_ItemsMap.map.get(itemHrid)?.get(enhancementLevel) ?? 0;
@@ -3723,7 +3748,7 @@
             return max;
         }
         // 更新物品数据
-        static update(endCharacterItems) {
+        static update(endCharacterItems, notify = true) {
             if (!endCharacterItems) {
                 return;
             }
@@ -3756,7 +3781,7 @@
                 if (totals.size) this.map.set(hrid, totals);
                 else this.map.delete(hrid);
             }
-            if (!changed) return;
+            if (!changed || !notify) return;
             MWI_Calculator_ItemsMap.itemsUpdatedCallbacks.forEach(cb => {
                 try {
                     cb(endCharacterItems);
