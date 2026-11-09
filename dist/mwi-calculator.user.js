@@ -513,6 +513,7 @@
             MWI_Calculator_Calculator.requiredItemDetailsMap.forEach((details, key) => {
                 detailsState[`required_${key}`] = details.open;
             });
+            if (this.downgradeDetails) detailsState.downgrade = this.downgradeDetails.open;
             try {
                 GM_setValue(storageKey_Details, JSON.stringify(detailsState));
             }
@@ -522,9 +523,14 @@
         }
         // 恢复所有 details 元素的 open 状态
         static restoreDetailsOpenState(storageKey_Details) {
+            // 无历史记录时保留默认展开；切角色时不沿用上一个角色的状态。
+            if (this.downgradeDetails) this.downgradeDetails.open = true;
             try {
                 const saved = GM_getValue(storageKey_Details, '{}');
                 const detailsState = JSON.parse(saved);
+                if (this.downgradeDetails && typeof detailsState?.downgrade === 'boolean') {
+                    this.downgradeDetails.open = detailsState.downgrade;
+                }
                 // 恢复 targetItemDetailsMap
                 MWI_Calculator_Calculator.targetItemDetailsMap.forEach((details, key) => {
                     if (typeof detailsState[`target_${key}`] === 'boolean') {
@@ -740,6 +746,7 @@
             const categoryStates = [...categories.values()].map(category => [category, category.needCalc]);
             const details = [this.targetItemDetailsMap, this.shortageItemDetailsMap, this.requiredItemDetailsMap]
                 .flatMap(map => [...map.values()].map(element => [element, element.open, element.hidden]));
+            if (this.downgradeDetails) details.push([this.downgradeDetails, this.downgradeDetails.open, this.downgradeDetails.hidden]);
             try {
                 for (const field of ['TargetItems', 'TargetItemCategories', 'DetailsOpenState', 'AcquisitionOptions']) {
                     const key = destinationKey.replace('TargetItems', field);
@@ -754,6 +761,7 @@
                 for (const [prefix, map] of [['target', this.targetItemDetailsMap], ['shortage', this.shortageItemDetailsMap], ['required', this.requiredItemDetailsMap]]) {
                     map.forEach((element, key) => { expectedDetails[`${prefix}_${key}`] = element.open; });
                 }
+                if (this.downgradeDetails) expectedDetails.downgrade = this.downgradeDetails.open;
                 const expected = [
                     [...this.targetItemsMap.values()].map(({ itemHrid, count, needCalc }) => ({ itemHrid, count, needCalc })),
                     [...this.targetItemCategoryMap.values()].map(({ categoryHrid, needCalc }) => ({ categoryHrid, needCalc })),
@@ -966,7 +974,9 @@
                     .sort(([a], [b]) => a - b))]));
             const useEnhanced = (itemHrid, need, needsDowngrade) => {
                 let remaining = need;
-                for (const [level, available] of enhanced.get(itemHrid) || []) {
+                const levels = [...(enhanced.get(itemHrid) || [])];
+                if (!needsDowngrade) levels.reverse(); // 升级基底与制作跳转一致，优先保留最高强化。
+                for (const [level, available] of levels) {
                     if (!(remaining > 0)) break;
                     const used = Math.min(Math.floor(available), Math.ceil(remaining));
                     if (!(used > 0)) continue;
@@ -992,18 +1002,48 @@
                     inventoryMap.set(targetItem.itemHrid, (inventoryMap.get(targetItem.itemHrid) || 0) - targetItem.count);
                 } else enqueue(targetItem.itemHrid, targetItem.count, 'target');
             });
+            // 父配方全部展开后才处理材料：避免先把强化库存降级，随后才发现升级基底需求。
+            const recipes = new Map(), incoming = new Map(), edges = new Map();
+            const pending = [...queueMap.keys()];
+            for (let i = 0; i < pending.length; i++) {
+                const hrid = pending[i];
+                if (recipes.has(hrid)) continue;
+                const stop = this.houseAcquisitionMode === 'buy' && this.showIntermediateProducts === false
+                    && MWI_Calculator.initClientData?.itemDetailMap?.[hrid]?.isTradable === true;
+                const recipe = stop ? null : MWI_Calculator_ActionDetailPlus.tryGetRecipe(hrid);
+                recipes.set(hrid, recipe);
+                if (!incoming.has(hrid)) incoming.set(hrid, 0);
+                const children = new Set((recipe?.inputs || []).filter(input => input.count > 0).map(input => input.itemHrid));
+                edges.set(hrid, children);
+                for (const child of children) {
+                    incoming.set(child, (incoming.get(child) || 0) + 1);
+                    pending.push(child);
+                }
+            }
+            const ready = [...incoming].filter(([, n]) => n === 0).map(([hrid]) => hrid), rank = new Map();
+            for (let i = 0; i < ready.length; i++) {
+                const hrid = ready[i]; rank.set(hrid, i);
+                for (const child of edges.get(hrid) || []) {
+                    incoming.set(child, incoming.get(child) - 1);
+                    if (incoming.get(child) === 0) ready.push(child);
+                }
+            }
             while (queueMap.size > 0) {
-                const [itemHrid, needs] = queueMap.entries().next().value;
+                const itemHrid = [...queueMap.keys()].reduce((best, hrid) =>
+                    (rank.get(hrid) ?? Infinity) < (rank.get(best) ?? Infinity) ? hrid : best);
+                const needs = queueMap.get(itemHrid);
                 queueMap.delete(itemHrid);
-                // 0级先满足目标和普通材料；强化库存优先留给可直接继承强化的升级基底。
+                // 先满足最终目标，再把强化库存留给升级基底，最后分配普通材料。
                 let available = Math.max(0, inventoryMap.get(itemHrid) || 0);
-                for (const purpose of ['target', 'material', 'upgrade']) {
+                const targetUsed = Math.min(available, needs.target);
+                available -= targetUsed; needs.target -= targetUsed;
+                needs.upgrade = useEnhanced(itemHrid, needs.upgrade, false);
+                for (const purpose of ['material', 'upgrade']) {
                     const used = Math.min(available, needs[purpose]);
                     available -= used;
                     needs[purpose] -= used;
                 }
                 inventoryMap.set(itemHrid, available);
-                needs.upgrade = useEnhanced(itemHrid, needs.upgrade, false);
                 needs.material = useEnhanced(itemHrid, needs.material, true);
                 const remain = needs.target + needs.material + needs.upgrade;
                 if (!(remain > 0)) continue;
@@ -1011,7 +1051,7 @@
                 // 仅成品只在可交易物品处停止；不可交易产品继续展开可购买材料。
                 if (this.houseAcquisitionMode === 'buy' && this.showIntermediateProducts === false
                     && MWI_Calculator.initClientData?.itemDetailMap?.[itemHrid]?.isTradable === true) continue;
-                const recipe = MWI_Calculator_ActionDetailPlus.tryGetRecipe(itemHrid);
+                const recipe = recipes.get(itemHrid);
                 if (!recipe) continue;
                 const redundant = (this.houseAcquisitionMode !== 'buy' || this.showIntermediateProducts !== false) && this.materialPlanningMode === 'redundant';
                 const times = this.getProductionActionCount(recipe, remain);
@@ -2448,6 +2488,9 @@
             this.downgradeItemsContainer = itemsContainer;
             this.downgradeDetails = details;
             this.downgradeRows = new Map();
+            details.addEventListener('toggle', () => {
+                if (this.downgradeDetails === details) this.saveDetailsOpenState();
+            });
             return details;
         }
         static renderDowngradeItems(items) {
@@ -2653,6 +2696,8 @@
         }
         // 尝试打开动作面板
         static TryGotoActionDetailByRequiredItem(requiredItem) {
+            clearTimeout(this.upgradeSelectionTimer);
+            const selectionToken = this.upgradeSelectionToken = (this.upgradeSelectionToken || 0) + 1;
             const actionHrid = MWI_Calculator_ActionDetailPlus.getActionHrid(requiredItem.displayName)
                 ?? MWI_Calculator_ActionDetailPlus.processableActionMap.get(requiredItem.itemHrid);
             if (!actionHrid) {
@@ -2671,6 +2716,11 @@
                     actionHrid, requiredItem.itemHrid, outputCount);
                 const actionCount = MWI_Calculator_Calculator.getProductionActionCount(production, requiredItem.shortageCount);
                 MWI_Calculator.gameObject.handleGoToAction(actionHrid, actionCount);
+                if (upgradeItemHrid) {
+                    const characterID = this.activeCharacterID;
+                    this.upgradeSelectionTimer = setTimeout(() =>
+                        this.selectHighestUpgradeItem(actionHrid, upgradeItemHrid, selectionToken, 0, characterID), 100);
+                }
             }
             else {
                 // 三采使用单侧99.9%正态近似增加随机产出余量
@@ -2700,8 +2750,92 @@
                 MWI_Calculator.gameObject.handleGoToAction(actionHrid, actionCount);
             }
         }
+        // 不依赖具体 CSS 或 DOM 上可枚举的 Fiber 属性；优先遍历 React 当前已提交的树。
+        static findUpgradeActionHost(game, actionHrid, upgradeItemHrid) {
+            const roots = [], seen = new Set();
+            const push = value => {
+                let fiber = value?.current ?? value;
+                if (!fiber || typeof fiber !== 'object') return;
+                let top = fiber;
+                for (let n = 0; top.return && n < 100; n++) top = top.return;
+                // DOM 绑定的 Fiber 可能是 alternate，HostRoot.current 才是已提交的分支。
+                fiber = top.stateNode?.current || fiber;
+                roots.push(fiber);
+            };
+            push(game?._reactInternals);
+            push(game?._reactInternalFiber);
+            const root = document.getElementById('root');
+            push(root?._reactRootContainer?._internalRoot?.current);
+            push(root?._reactRootContainer?.current);
+            for (const element of [root, document.body,
+                ...document.querySelectorAll('[class*="SkillActionDetail_upgradeItemSelectorInput"], [class*="SkillActionDetail_regularComponent"]')]) {
+                for (const key of Object.getOwnPropertyNames(element || {})) {
+                    if (/^__react(Container|Fiber|InternalInstance)/.test(key)) push(element[key]);
+                }
+            }
+            while (roots.length && seen.size < 50000) {
+                const fiber = roots.pop();
+                if (!fiber || seen.has(fiber)) continue;
+                seen.add(fiber);
+                const host = fiber.stateNode;
+                if (host?.props?.actionDetail?.hrid === actionHrid
+                    && host.props.actionDetail.upgradeItemHrid === upgradeItemHrid
+                    && typeof host.selectUpgradeItemHandler === 'function') return host;
+                if (fiber.child) roots.push(fiber.child);
+                if (fiber.sibling) roots.push(fiber.sibling);
+                // 无 HostRoot 的兼容路径仍可从选择器 DOM 向上寻找其 owner。
+                if (fiber.return) roots.push(fiber.return);
+            }
+            return null;
+        }
+        // 使用游戏原生选择处理器，不修改数量、不提交制作；仅选仓库中可用的升级基底。
+        static selectHighestUpgradeItem(actionHrid, upgradeItemHrid, token, attempt = 0, characterID = this.activeCharacterID) {
+            if (token !== this.upgradeSelectionToken || characterID !== this.activeCharacterID) return false;
+            const report = (status, level = null, terminal = false) => {
+                this.upgradeSelectionDiagnostic = { actionHrid, upgradeItemHrid, status, level, attempt };
+                if (terminal) console.info('[MWI_Calculator] 升级自自动选择', this.upgradeSelectionDiagnostic);
+            };
+            if (!this.canUseCharacterData()) { report('character-not-ready', null, true); return false; }
+            const game = MWI_Calculator.getGameObject() || MWI_Calculator.gameObject;
+            if (this.normalizeCharacterID(game?.state?.character?.id) !== characterID) {
+                report('character-mismatch', null, true); return false;
+            }
+            let best = null;
+            for (const [hash, item] of game?.state?.characterItemMap || []) {
+                if (item.itemHrid !== upgradeItemHrid || item.itemLocationHrid !== '/item_locations/inventory'
+                    || !(item.count > 0) || !Number.isInteger(item.enhancementLevel) || item.enhancementLevel < 0) continue;
+                if (!best || item.enhancementLevel > best.level) best = { hash, level: item.enhancementLevel };
+            }
+            if (!best) { report('no-inventory-candidate', null, true); return false; }
+            const host = this.findUpgradeActionHost(game, actionHrid, upgradeItemHrid);
+            let status = 'action-component-not-found';
+            if (host) {
+                const owned = host.props.characterItemMap?.get(best.hash);
+                if (!owned || owned.itemHrid !== upgradeItemHrid || !(owned.count > 0)) status = 'component-inventory-not-ready';
+                else if (host.state?.primaryItemHash === best.hash
+                    && host.state?.primaryItem?.itemHrid === upgradeItemHrid
+                    && host.state.primaryItem.enhancementLevel === best.level) {
+                    this.upgradeSelectionTimer = null;
+                    report('selected', best.level, true);
+                    return true;
+                } else {
+                    status = 'selection-not-committed';
+                    if (attempt < 30) {
+                        try { host.selectUpgradeItemHandler(best.hash); }
+                        catch (error) { status = 'selection-handler-error'; }
+                    }
+                }
+            }
+            report(status, best.level, attempt >= 30);
+            if (attempt < 30) this.upgradeSelectionTimer = setTimeout(() =>
+                this.selectHighestUpgradeItem(actionHrid, upgradeItemHrid, token, attempt + 1, characterID), 100);
+            else this.upgradeSelectionTimer = null;
+            return false;
+        }
         // 购买模式进入游戏市场并预选物品（独立实现）
         static TryGotoMarketplaceByRequiredItem(requiredItem) {
+            clearTimeout(this.upgradeSelectionTimer);
+            this.upgradeSelectionToken = (this.upgradeSelectionToken || 0) + 1;
             const itemHrid = String(requiredItem?.itemHrid || '');
             if (!itemHrid) return false;
             const level = Number(requiredItem?.enhancementLevel) || 0;
