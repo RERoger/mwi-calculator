@@ -8,7 +8,12 @@
 - **[从 GitHub 安装 / 切换到 GitHub 更新源](https://raw.githubusercontent.com/RERoger/mwi-calculator/main/dist/mwi-calculator.user.js)**
 - [GreasyFork 原发布页](https://greasyfork.org/zh-CN/scripts/593184)
 
-当前镜像版本：**0.0.9**。除安装/更新及项目链接外，业务代码与本次获取的 GreasyFork 版本一致。
+当前版本：**0.1.8**。
+
+- 制作/购买选项随清单保存。
+- 购买清单支持“备料 / 仅成品”；备料时可选择“冗余 / 极限”。
+- 仅成品只统计最终目标及房屋直接升级需求，不递归展开原材料。
+- 保留此前角色隔离、强化装备处理、市场数量填充和导入修复。
 
 ### 已有用户
 

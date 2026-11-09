@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         [银河奶牛]生产制作计算器
-// @version      0.1.7
+// @version      0.1.8
 // @namespace    http://tampermonkey.net/
 // @description  银河奶牛计算器，自动计算需求缺口，一键跳转到制作、购买。Calculator for MilkyWayIdle，Automatically calculate supply-demand gaps and navigate to production or purchasing with a single click.
 // @author       RERoger
@@ -548,6 +548,10 @@
                 console.error('[MWI_Calculator] 恢复Details open状态失败', error);
             }
         }
+        static getAcquisitionOptions() {
+            return { mode: this.houseAcquisitionMode === 'buy' ? 'buy' : 'craft',
+                showIntermediateProducts: this.showIntermediateProducts !== false };
+        }
         // 保存数据
         static saveCalculatorData() {
             if (!this.canUseCharacterData()) return false;
@@ -567,6 +571,7 @@
             try {
                 GM_setValue(storageKey, JSON.stringify(dataToSave));
                 GM_setValue(storageKey_Category, JSON.stringify(dataToSave_Category));
+                GM_setValue(storageKey.replace('TargetItems', 'AcquisitionOptions'), JSON.stringify(this.getAcquisitionOptions()));
                 return true;
             }
             catch (error) {
@@ -600,7 +605,13 @@
                 for (const category of loadedCategories) {
                     if (!category || typeof category.categoryHrid !== 'string') throw new Error('分类格式无效');
                 }
+                let options = {};
+                try { options = JSON.parse(GM_getValue(storageKey.replace('TargetItems', 'AcquisitionOptions'), '{}')) || {}; }
+                catch { options = {}; }
                 this.resetCharacterView();
+                this.houseAcquisitionMode = options.mode === 'buy' ? 'buy' : 'craft';
+                this.showIntermediateProducts = options.showIntermediateProducts !== false;
+                this.updateAcquisitionOptionsUI?.();
                 this.activeCharacterID = destinationID;
                 this.targetItemsMap = validItemsMap; // 空清单也必须替换，避免旧角色残留。
                 for (const category of loadedCategories) {
@@ -706,9 +717,9 @@
             const destinationKey = this.getStorageKey(this.activeCharacterID);
             try {
                 const backup = {};
-                for (const field of ['TargetItems', 'TargetItemCategories', 'DetailsOpenState']) {
+                for (const field of ['TargetItems', 'TargetItemCategories', 'DetailsOpenState', 'AcquisitionOptions']) {
                     const key = destinationKey.replace('TargetItems', field);
-                    backup[key] = GM_getValue(key, field === 'DetailsOpenState' ? '{}' : '[]');
+                    backup[key] = GM_getValue(key, ['DetailsOpenState', 'AcquisitionOptions'].includes(field) ? '{}' : '[]');
                 }
                 GM_setValue(destinationKey + '_BackupBeforeImport', JSON.stringify(backup));
                 return true;
@@ -725,13 +736,14 @@
             const records = [];
             const items = new Map(this.targetItemsMap);
             const categories = new Map(this.targetItemCategoryMap);
+            const acquisition = this.getAcquisitionOptions();
             const categoryStates = [...categories.values()].map(category => [category, category.needCalc]);
             const details = [this.targetItemDetailsMap, this.shortageItemDetailsMap, this.requiredItemDetailsMap]
                 .flatMap(map => [...map.values()].map(element => [element, element.open, element.hidden]));
             try {
-                for (const field of ['TargetItems', 'TargetItemCategories', 'DetailsOpenState']) {
+                for (const field of ['TargetItems', 'TargetItemCategories', 'DetailsOpenState', 'AcquisitionOptions']) {
                     const key = destinationKey.replace('TargetItems', field);
-                    records.push([key, GM_getValue(key, field === 'DetailsOpenState' ? '{}' : '[]')]);
+                    records.push([key, GM_getValue(key, ['DetailsOpenState', 'AcquisitionOptions'].includes(field) ? '{}' : '[]')]);
                 }
                 const result = apply();
                 if (!result) throw new Error('导入加载失败');
@@ -745,7 +757,8 @@
                 const expected = [
                     [...this.targetItemsMap.values()].map(({ itemHrid, count, needCalc }) => ({ itemHrid, count, needCalc })),
                     [...this.targetItemCategoryMap.values()].map(({ categoryHrid, needCalc }) => ({ categoryHrid, needCalc })),
-                    expectedDetails
+                    expectedDetails,
+                    this.getAcquisitionOptions()
                 ];
                 records.forEach(([key], index) => {
                     if (GM_getValue(key) !== JSON.stringify(expected[index])) throw new Error('导入写入校验失败');
@@ -763,6 +776,9 @@
                 }
                 this.targetItemsMap = items;
                 this.targetItemCategoryMap = categories;
+                this.houseAcquisitionMode = acquisition.mode;
+                this.showIntermediateProducts = acquisition.showIntermediateProducts;
+                this.updateAcquisitionOptionsUI?.();
                 categoryStates.forEach(([category, enabled]) => { category.needCalc = enabled; });
                 details.forEach(([element, open, hidden]) => { element.open = open; element.hidden = hidden; });
                 this.characterDataLoaded = restored;
@@ -992,9 +1008,10 @@
                 const remain = needs.target + needs.material + needs.upgrade;
                 if (!(remain > 0)) continue;
                 result.set(itemHrid, (result.get(itemHrid) || 0) + remain);
+                if (this.houseAcquisitionMode === 'buy' && this.showIntermediateProducts === false) continue;
                 const recipe = MWI_Calculator_ActionDetailPlus.tryGetRecipe(itemHrid);
                 if (!recipe) continue;
-                const redundant = this.materialPlanningMode === 'redundant';
+                const redundant = (this.houseAcquisitionMode !== 'buy' || this.showIntermediateProducts !== false) && this.materialPlanningMode === 'redundant';
                 const times = this.getProductionActionCount(recipe, remain);
                 for (const input of recipe.inputs) {
                     const amount = redundant ? this.getMaterialBudget(input.count, times, input.consumptionVariance || 0) : input.count * times;
@@ -1415,7 +1432,6 @@
             rightDiv.style.flexDirection = 'column';
             rightDiv.style.width = '40%';
             rightDiv.style.padding = '0px 2px';
-            rightDiv.appendChild(MWI_Calculator_Calculator.createMaterialPlanningModeSelector());
             rightDiv.appendChild(MWI_Calculator_Calculator.createHouseAcquisitionModeSelector());
             rightDiv.appendChild(this.createDowngradeSection());
             const shortageItemDetails = document.createElement('details');
@@ -1984,13 +2000,67 @@
                 button.style.cursor = 'pointer';
                 button.addEventListener('click', () => {
                     MWI_Calculator_Calculator.houseAcquisitionMode = mode;
-                    updateModeButtons();
+                    MWI_Calculator_Calculator.marketAutoFillTarget = null;
+                    MWI_Calculator_Calculator.updateAcquisitionOptionsUI();
+                    MWI_Calculator_Calculator.saveAndScheduleRender();
                 });
                 modeButtons[mode] = button;
                 modeSelector.appendChild(button);
             });
-            updateModeButtons();
-            return modeSelector;
+            const wrapper = document.createElement('div');
+            wrapper.style.minWidth = '0';
+            const planning = this.createMaterialPlanningModeSelector();
+            const intermediate = document.createElement('div');
+            intermediate.className = 'mwi-planning-selector';
+            intermediate.style.cssText = 'display:flex;align-items:center;background:#2c2e45;border-radius:4px;padding:4px;margin:2px';
+            const label = document.createElement('span');
+            label.className = 'mwi-planning-label';
+            label.textContent = MWI_Calculator_I18n.isChinese() ? '购买清单' : 'Purchase list';
+            label.title = MWI_Calculator_I18n.isChinese() ? '备料：展开原材料；仅成品：只计算最终需求' : 'Materials: expand recipes; Finished only: final requirements';
+            label.style.cssText = 'flex:0 0 auto;white-space:nowrap;color:#fff;margin:0 6px 0 2px';
+            intermediate.appendChild(label);
+            const intermediateButtons = [];
+            [[true, '备料', 'Materials'], [false, '仅成品', 'Finished only']].forEach(([show, zh, en]) => {
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.textContent = MWI_Calculator_I18n.isChinese() ? zh : en;
+                button.style.cssText = 'flex:1;color:#fff;border:none;border-radius:4px;padding:4px;margin:2px;cursor:pointer';
+                button.addEventListener('click', () => {
+                    this.showIntermediateProducts = show;
+                    this.marketAutoFillTarget = null;
+                    this.updateAcquisitionOptionsUI();
+                    this.saveAndScheduleRender();
+                });
+                intermediateButtons.push({ button, show });
+                intermediate.appendChild(button);
+            });
+            // 共用同一个设置框，始终位于制作/购买框下方；只切换框内内容。
+            const optionsFrame = document.createElement('div');
+            optionsFrame.className = 'mwi-acquisition-options';
+            optionsFrame.style.cssText = 'min-width:0;background:#2c2e45;border-radius:4px;padding:4px;margin:2px';
+            for (const row of [planning, intermediate]) {
+                row.style.background = 'transparent';
+                row.style.margin = '0';
+                row.style.padding = '0';
+            }
+            optionsFrame.append(intermediate, planning);
+            wrapper.append(modeSelector, optionsFrame);
+            this.updateAcquisitionOptionsUI = () => {
+                updateModeButtons();
+                const buying = this.houseAcquisitionMode === 'buy';
+                const showPlanning = !buying || this.showIntermediateProducts !== false;
+                planning.hidden = !showPlanning;
+                planning.style.display = showPlanning ? 'flex' : 'none';
+                intermediate.hidden = !buying;
+                intermediate.style.display = buying ? 'flex' : 'none';
+                intermediateButtons.forEach(({ button, show }) => {
+                    const selected = (this.showIntermediateProducts !== false) === show;
+                    button.style.background = selected ? '#1976D2' : '#6B7280';
+                    button.setAttribute('aria-pressed', String(selected));
+                });
+            };
+            this.updateAcquisitionOptionsUI();
+            return wrapper;
         }
         static isIronCowMode() {
             const gameObject = MWI_Calculator.gameObject;
@@ -2786,7 +2856,7 @@
         // 制作备料与跳转共用：冗余取概率次数，极限取平均次数；均不超过保底次数。
         static getProductionActionCount(recipe, target) {
             const count = this.getRequiredTrials999(recipe.outputCount, target,
-                this.materialPlanningMode === 'redundant' ? (recipe.outputStdDev || 0) : 0);
+                (this.houseAcquisitionMode !== 'buy' || this.showIntermediateProducts !== false) && this.materialPlanningMode === 'redundant' ? (recipe.outputStdDev || 0) : 0);
             const minimum = recipe.minimumOutputCount;
             return Number.isFinite(minimum) && minimum > 0
                 ? Math.min(count, Math.max(0, Math.ceil(target / minimum))) : count;
@@ -2809,6 +2879,7 @@
     MWI_Calculator_Calculator.targetItemsMap = new Map();
     MWI_Calculator_Calculator.requiredItemsMap = new Map();
     MWI_Calculator_Calculator.houseAcquisitionMode = 'craft';
+    MWI_Calculator_Calculator.showIntermediateProducts = true;
     MWI_Calculator_Calculator.materialPlanningMode = 'redundant';
     MWI_Calculator_Calculator.tabButton = null;
     MWI_Calculator_Calculator.tabPanel = null;
